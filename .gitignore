@@ -1,0 +1,33 @@
+# ReComp Launcher — user data (never commit a user's library / downloaded art)
+data/
+
+# Claude Code / local tooling config
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.manifest
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Logs / temp scratch files
+*.log
+_*.py
+_*.txt

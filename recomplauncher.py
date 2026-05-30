@@ -1,0 +1,2290 @@
+"""ReComp Launcher — a launcher/library for Nintendo recompiled & decomp-ported games.
+
+Features: box-art grid (resizable, drag-reorder), per-game details with hero banner,
+themes, folder scanning, tags/favorites, playtime tracking, launch profiles,
+GitHub update checking, screenshots, system tray, keyboard shortcuts.
+
+Run with:  python recomplauncher.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import uuid
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import requests
+from PyQt6.QtCore import (
+    Qt, QSize, QThread, pyqtSignal, QObject, QAbstractListModel, QModelIndex,
+    QMimeData, QByteArray, QRect, QRectF, QTimer, QPropertyAnimation, QPoint,
+    QEasingCurve,
+)
+from PyQt6.QtGui import (
+    QPixmap, QIcon, QAction, QPainter, QColor, QFont, QLinearGradient, QBrush,
+    QPen, QFontMetrics, QKeySequence, QShortcut, QImage,
+)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+    QPushButton, QFrame, QFileDialog, QDialog, QLineEdit, QFormLayout, QTextEdit,
+    QMessageBox, QListWidget, QListWidgetItem, QDialogButtonBox, QToolBar,
+    QStatusBar, QInputDialog, QListView, QStyledItemDelegate, QStyle,
+    QAbstractItemView, QComboBox, QSlider, QTabWidget, QSystemTrayIcon, QMenu,
+    QGraphicsOpacityEffect, QCheckBox, QScrollArea, QSizePolicy,
+)
+
+# ======================================================================
+# Config & paths
+# ======================================================================
+
+APP_NAME = "ReComp Launcher"
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+ART_DIR = DATA_DIR / "art"
+SHOTS_DIR = DATA_DIR / "screenshots"
+GAMES_FILE = DATA_DIR / "games.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+for _d in (DATA_DIR, ART_DIR, SHOTS_DIR):
+    _d.mkdir(exist_ok=True)
+
+USER_AGENT = "ReCompLauncher/0.2 (https://github.com/)"
+
+# Custom item-data roles
+ROLE_GAME = Qt.ItemDataRole.UserRole + 1
+
+BASE_CARD_W, BASE_CARD_H = 168, 250  # at scale 1.0
+
+# Executables to ignore when scanning a folder for games.
+SCAN_BLACKLIST = re.compile(
+    r"(unins|setup|install|vc_?redist|vcredist|dxsetup|dxwebsetup|crashpad|"
+    r"crashreport|update|helper|launcher|notification|dotnet|redist)",
+    re.IGNORECASE,
+)
+
+# ======================================================================
+# Known-recomp fingerprint database
+# ----------------------------------------------------------------------
+# Maps the executables/folder names that recompiled & decomp PC ports ship
+# under to the actual game they are, so a folder scan (or the Identify
+# button) can auto-fill title, platform, search name, GitHub repo and tags
+# instead of the user renaming everything by hand.
+#
+# This list is deliberately easy to extend — a great place for community
+# pull requests. `names` = exact executable filenames (case-insensitive);
+# `patterns` = substrings matched against the exe stem AND its parent folder
+# name (catches versioned build dirs like "Zelda64Recompiled-v1.2.0-win64").
+# More specific entries must come before generic ones (coop before sm64).
+# ======================================================================
+KNOWN_RECOMPS: list[dict] = [
+    {
+        "names": ["soh.exe"], "patterns": ["shipofharkinian", "shipwright"],
+        "title": "The Legend of Zelda: Ocarina of Time",
+        "platform": "Ship of Harkinian", "search": "The Legend of Zelda: Ocarina of Time",
+        "github_repo": "HarbourMasters/Shipwright", "tags": ["Zelda", "N64"],
+    },
+    {
+        "names": ["2ship.exe", "2s2h.exe"], "patterns": ["2ship", "2s2h"],
+        "title": "The Legend of Zelda: Majora's Mask",
+        "platform": "2 Ship 2 Harkinian", "search": "The Legend of Zelda: Majora's Mask",
+        "github_repo": "HarbourMasters/2ship2harkinian", "tags": ["Zelda", "N64"],
+    },
+    {
+        "names": ["zelda64recompiled.exe", "zelda64recomp.exe", "mm.exe"],
+        "patterns": ["zelda64recomp", "mmrecomp"],
+        "title": "The Legend of Zelda: Majora's Mask",
+        "platform": "Zelda 64: Recompiled", "search": "The Legend of Zelda: Majora's Mask",
+        "github_repo": "Zelda64Recomp/Zelda64Recomp", "tags": ["Zelda", "N64", "Recompiled"],
+    },
+    {
+        "names": ["starship.exe"], "patterns": ["starship"],
+        "title": "Star Fox 64",
+        "platform": "Starship", "search": "Star Fox 64",
+        "github_repo": "HarbourMasters/Starship", "tags": ["Star Fox", "N64"],
+    },
+    {
+        "names": ["perfectdark.exe", "pd.exe"], "patterns": ["perfectdark", "perfect_dark"],
+        "title": "Perfect Dark",
+        "platform": "Perfect Dark (decomp port)", "search": "Perfect Dark 2000",
+        "github_repo": "fgsfdsfgs/perfect_dark", "tags": ["Rare", "N64"],
+    },
+    {
+        "names": ["banjorecompiled.exe", "banjo.exe"], "patterns": ["banjorecomp", "banjo"],
+        "title": "Banjo-Kazooie",
+        "platform": "Banjo: Recompiled", "search": "Banjo-Kazooie",
+        "github_repo": "BanjoRecomp/BanjoRecomp", "tags": ["Rare", "N64", "Recompiled"],
+    },
+    {
+        "names": ["goemon64recompiled.exe", "goemon.exe"], "patterns": ["goemon64recomp", "goemon"],
+        "title": "Mystical Ninja Starring Goemon",
+        "platform": "Goemon 64: Recompiled", "search": "Mystical Ninja Starring Goemon",
+        "github_repo": "klorfmorf/Goemon64Recomp", "tags": ["Goemon", "N64", "Recompiled"],
+    },
+    {
+        # Dusk: reverse-engineered reimplementation of Twilight Princess (GameCube),
+        # built on the Aurora engine. Patterns kept specific to avoid matching the
+        # unrelated "DUSK" retro FPS.
+        "names": ["dusk.exe"], "patterns": ["dusk-zelda", "duskzelda", "twilitrealm"],
+        "title": "The Legend of Zelda: Twilight Princess",
+        "platform": "Dusk (decomp reimplementation)",
+        "search": "The Legend of Zelda: Twilight Princess",
+        "github_repo": "JapanDoudou/dusk-zelda", "tags": ["Zelda", "GameCube", "Decomp"],
+    },
+    # ----- Non-Nintendo recomps / decomp PC ports -----
+    {
+        "names": ["unleashedrecomp.exe"], "patterns": ["unleashedrecomp"],
+        "title": "Sonic Unleashed",
+        "platform": "Unleashed Recompiled", "search": "Sonic Unleashed",
+        "github_repo": "hedge-dev/UnleashedRecomp", "tags": ["Sonic", "Xbox 360", "Recompiled"],
+    },
+    {
+        "names": ["doom64ex-plus.exe", "doom64ex.exe"], "patterns": ["doom64ex", "doom64"],
+        "title": "Doom 64",
+        "platform": "Doom 64 EX-Plus", "search": "Doom 64",
+        "github_repo": "Erick194/Doom64EX-Plus", "tags": ["Doom", "N64", "Source Port"],
+    },
+    {
+        "names": ["rsdkv4.exe"], "patterns": ["sonic-1-2-2013", "rsdkv4"],
+        "title": "Sonic the Hedgehog 1 & 2 (2013)",
+        "platform": "RSDKv4 Decompilation", "search": "Sonic the Hedgehog",
+        "github_repo": "RSDKModding/RSDKv4-Decompilation", "tags": ["Sonic", "Retro Engine", "Decomp"],
+    },
+    {
+        "names": ["rsdkv3.exe"], "patterns": ["sonic-cd", "rsdkv3"],
+        "title": "Sonic CD (2011)",
+        "platform": "RSDKv3 Decompilation", "search": "Sonic CD",
+        "github_repo": "RSDKModding/RSDKv3-Decompilation", "tags": ["Sonic", "Retro Engine", "Decomp"],
+    },
+    {
+        # OpenGOAL runtime ships the game as gk.exe ("game kernel"); patterns keep
+        # the parent-folder match specific so a stray gk.exe elsewhere won't match.
+        "names": ["gk.exe"], "patterns": ["opengoal", "jak-project", "jak1", "jak2"],
+        "title": "Jak and Daxter: The Precursor Legacy",
+        "platform": "OpenGOAL", "search": "Jak and Daxter The Precursor Legacy",
+        "github_repo": "open-goal/jak-project", "tags": ["Jak", "PS2", "Decomp"],
+    },
+    {
+        "names": ["sm64coopdx.exe"], "patterns": ["sm64coopdx", "coopdx"],
+        "title": "Super Mario 64: Co-op Deluxe",
+        "platform": "sm64coopdx", "search": "Super Mario 64",
+        "github_repo": "coop-deluxe/sm64coopdx", "tags": ["Mario", "N64", "Co-op"],
+    },
+    {
+        "names": ["sm64.us.f3dex2e.exe", "sm64.exe", "sm64ex.exe", "sm64plus.exe"],
+        "patterns": ["sm64ex", "sm64plus", "sm64-port", "sm64"],
+        "title": "Super Mario 64",
+        "platform": "sm64ex / sm64plus", "search": "Super Mario 64",
+        "github_repo": "", "tags": ["Mario", "N64"],
+    },
+]
+
+
+def identify_exe(exe_path: str) -> dict | None:
+    """Return the matching KNOWN_RECOMPS entry for an executable, or None."""
+    p = Path(exe_path)
+    name = p.name.lower()
+    stem = p.stem.lower()
+    parent = p.parent.name.lower()
+    for entry in KNOWN_RECOMPS:
+        if name in entry["names"]:
+            return entry
+    for entry in KNOWN_RECOMPS:                  # second pass: fuzzy patterns
+        for pat in entry.get("patterns", []):
+            if pat in stem or pat in parent:
+                return entry
+    return None
+
+
+# ----- Themes -----------------------------------------------------------
+THEMES: dict[str, dict[str, str]] = {
+    "Dracula": {
+        "bg": "#1e1f29", "surface": "#282a36", "surface2": "#21222c",
+        "text": "#f8f8f2", "subtext": "#6272a4", "accent": "#ff79c6",
+        "accent_text": "#1e1f29", "play": "#50fa7b", "play_text": "#1e1f29",
+        "border": "#44475a",
+    },
+    "Nord": {
+        "bg": "#2e3440", "surface": "#3b4252", "surface2": "#292e39",
+        "text": "#eceff4", "subtext": "#81a1c1", "accent": "#88c0d0",
+        "accent_text": "#2e3440", "play": "#a3be8c", "play_text": "#2e3440",
+        "border": "#4c566a",
+    },
+    "Midnight": {
+        "bg": "#0f0f1a", "surface": "#1a1a2e", "surface2": "#16162a",
+        "text": "#e6e6fa", "subtext": "#7c7caa", "accent": "#e94560",
+        "accent_text": "#ffffff", "play": "#00d9a3", "play_text": "#0f0f1a",
+        "border": "#2a2a4a",
+    },
+    "Light": {
+        "bg": "#f4f4f6", "surface": "#ffffff", "surface2": "#eaeaee",
+        "text": "#1e1e28", "subtext": "#6b6b80", "accent": "#d6336c",
+        "accent_text": "#ffffff", "play": "#2f9e44", "play_text": "#ffffff",
+        "border": "#d0d0d8",
+    },
+}
+
+
+def build_stylesheet(t: dict[str, str]) -> str:
+    return f"""
+        QMainWindow, QWidget {{ background: {t['bg']}; color: {t['text']};
+            font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; }}
+        QToolBar {{ background: {t['surface2']}; border: 0; padding: 6px; spacing: 6px; }}
+        QToolBar QToolButton {{ color: {t['text']}; padding: 6px 12px; border-radius: 6px; }}
+        QToolBar QToolButton:hover {{ background: {t['border']}; }}
+        QStatusBar {{ background: {t['surface2']}; color: {t['subtext']}; }}
+        #sidebar {{ background: {t['surface2']}; border: 0; }}
+        #sidebar::item {{ padding: 8px 12px; border-radius: 6px; }}
+        #sidebar::item:selected {{ background: {t['accent']}; color: {t['accent_text']}; }}
+        #sidebar::item:hover {{ background: {t['border']}; }}
+        QListView#grid {{ background: {t['bg']}; border: 0; }}
+        #detailsPanel {{ background: {t['surface']}; border-left: 1px solid {t['border']}; }}
+        QTabWidget::pane {{ border: 0; }}
+        QTabBar::tab {{ background: transparent; color: {t['subtext']};
+            padding: 6px 14px; border-bottom: 2px solid transparent; }}
+        QTabBar::tab:selected {{ color: {t['text']}; border-bottom: 2px solid {t['accent']}; }}
+        QPushButton {{ background: {t['border']}; color: {t['text']}; border: 0;
+            border-radius: 6px; padding: 6px 12px; }}
+        QPushButton:hover {{ background: {t['subtext']}; }}
+        QPushButton#playButton {{ background: {t['play']}; color: {t['play_text']};
+            font-size: 16px; font-weight: 700; border-radius: 8px; }}
+        QPushButton#playButton:hover {{ background: {t['play']}; }}
+        QPushButton#playButton:disabled {{ background: {t['border']}; color: {t['subtext']}; }}
+        QPushButton#stopButton {{ background: {t['accent']}; color: {t['accent_text']};
+            font-size: 16px; font-weight: 700; border-radius: 8px; }}
+        QLineEdit, QTextEdit, QComboBox {{ background: {t['surface2']}; color: {t['text']};
+            border: 1px solid {t['border']}; border-radius: 6px; padding: 5px; }}
+        QComboBox::drop-down {{ border: 0; }}
+        QComboBox QAbstractItemView {{ background: {t['surface2']}; color: {t['text']};
+            selection-background-color: {t['accent']}; }}
+        QScrollBar:vertical {{ background: {t['surface2']}; width: 12px; margin: 0; }}
+        QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 6px; min-height: 30px; }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QScrollBar:horizontal {{ background: {t['surface2']}; height: 12px; }}
+        QScrollBar::handle:horizontal {{ background: {t['border']}; border-radius: 6px; min-width: 30px; }}
+        QSlider::groove:horizontal {{ height: 4px; background: {t['border']}; border-radius: 2px; }}
+        QSlider::handle:horizontal {{ background: {t['accent']}; width: 14px; margin: -6px 0;
+            border-radius: 7px; }}
+        QCheckBox {{ spacing: 8px; }}
+    """
+
+
+# ======================================================================
+# Default library
+# ======================================================================
+
+DEFAULT_GAMES = [
+    {"title": "The Legend of Zelda: Ocarina of Time",
+     "platform": "Zelda 64: Recompiled",
+     "search": "The Legend of Zelda: Ocarina of Time",
+     "github_repo": "Zelda64Recomp/Zelda64Recomp",
+     "tags": ["Zelda", "N64"]},
+    {"title": "The Legend of Zelda: Majora's Mask",
+     "platform": "Majora's Mask: Recompiled",
+     "search": "The Legend of Zelda: Majora's Mask",
+     "github_repo": "Zelda64Recomp/Zelda64Recomp",
+     "tags": ["Zelda", "N64"]},
+    {"title": "Super Mario 64",
+     "platform": "sm64ex / sm64plus",
+     "search": "Super Mario 64",
+     "github_repo": "",
+     "tags": ["Mario", "N64"]},
+]
+
+
+def blank_game(title: str = "") -> dict:
+    return {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "platform": "",
+        "exe_path": "",
+        "args": "",
+        "art_path": "",
+        "banner_path": "",
+        "released": "",
+        "genres": "",
+        "description": "",
+        "search_name": title,
+        "github_repo": "",
+        "installed_version": "",
+        "latest_version": "",
+        "tags": [],
+        "favorite": False,
+        "playtime_seconds": 0,
+        "launch_count": 0,
+        "last_played": "",
+        "profiles": [],          # list of {"name": str, "args": str}
+        "screenshots": [],       # list of file paths
+    }
+
+
+# ======================================================================
+# Persistence
+# ======================================================================
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(path)
+
+
+def migrate_game(g: dict) -> dict:
+    """Fill in any fields added in later versions."""
+    base = blank_game()
+    base.update(g)
+    # legacy key rename
+    if "rawg_search" in g and not g.get("search_name"):
+        base["search_name"] = g["rawg_search"]
+    base.pop("rawg_search", None)
+    if not base.get("search_name"):
+        base["search_name"] = base.get("title", "")
+    if not isinstance(base.get("tags"), list):
+        base["tags"] = []
+    if not isinstance(base.get("profiles"), list):
+        base["profiles"] = []
+    if not isinstance(base.get("screenshots"), list):
+        base["screenshots"] = []
+    return base
+
+
+def load_library() -> list[dict]:
+    games = load_json(GAMES_FILE, None)
+    if games is None:
+        games = []
+        for g in DEFAULT_GAMES:
+            ng = blank_game(g["title"])
+            ng["platform"] = g["platform"]
+            ng["search_name"] = g["search"]
+            ng["github_repo"] = g.get("github_repo", "")
+            ng["tags"] = list(g.get("tags", []))
+            games.append(ng)
+        save_json(GAMES_FILE, games)
+        return games
+    return [migrate_game(g) for g in games]
+
+
+def save_library(games: list[dict]) -> None:
+    save_json(GAMES_FILE, games)
+
+
+def load_settings() -> dict:
+    s = load_json(SETTINGS_FILE, {})
+    s.setdefault("sgdb_api_key", "")
+    s.setdefault("theme", "Dracula")
+    s.setdefault("card_scale", 100)       # percent
+    s.setdefault("minimize_to_tray", False)
+    s.setdefault("check_updates_on_launch", True)
+    return s
+
+
+def save_settings(s: dict) -> None:
+    save_json(SETTINGS_FILE, s)
+
+
+# ======================================================================
+# Art helpers
+# ======================================================================
+
+_PIX_CACHE: dict[tuple, QPixmap] = {}
+
+
+def make_placeholder(title: str, size: tuple[int, int]) -> QPixmap:
+    w, h = size
+    pm = QPixmap(w, h)
+    pm.fill(QColor(40, 42, 54))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QColor(98, 114, 164))
+    p.setBrush(QColor(68, 71, 90))
+    p.drawRoundedRect(6, 6, w - 12, h - 12, 10, 10)
+    p.setPen(QColor(248, 248, 242))
+    f = QFont("Segoe UI", max(8, int(h / 22)))
+    f.setBold(True)
+    p.setFont(f)
+    p.drawText(pm.rect().adjusted(12, 12, -12, -12),
+               int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap), title)
+    p.end()
+    return pm
+
+
+def raw_art(game: dict) -> QPixmap:
+    path = game.get("art_path", "")
+    if path and Path(path).exists():
+        pm = QPixmap(path)
+        if not pm.isNull():
+            return pm
+    return QPixmap()
+
+
+def art_for(game: dict, w: int, h: int) -> QPixmap:
+    """Cached, scaled cover for a card (KeepAspectRatio, centered on transparent)."""
+    key = (game.get("art_path", ""), game.get("id"), w, h)
+    if key in _PIX_CACHE:
+        return _PIX_CACHE[key]
+    src = raw_art(game)
+    if src.isNull():
+        result = make_placeholder(game.get("title", "?"), (w, h))
+    else:
+        scaled = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+        result = QPixmap(w, h)
+        result.fill(Qt.GlobalColor.transparent)
+        p = QPainter(result)
+        x = (w - scaled.width()) // 2
+        y = (h - scaled.height()) // 2
+        p.drawPixmap(x, y, scaled)
+        p.end()
+    if len(_PIX_CACHE) > 200:
+        _PIX_CACHE.clear()
+    _PIX_CACHE[key] = result
+    return result
+
+
+def app_icon() -> QIcon:
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#ff79c6"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRoundedRect(6, 6, 52, 52, 14, 14)
+    p.setPen(QColor("#1e1f29"))
+    f = QFont("Segoe UI", 26); f.setBold(True)
+    p.setFont(f)
+    p.drawText(pm.rect(), int(Qt.AlignmentFlag.AlignCenter), "▶")
+    p.end()
+    return QIcon(pm)
+
+
+def fmt_playtime(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    mins = seconds // 60
+    if mins < 60:
+        return f"{mins} min"
+    hrs = mins / 60
+    return f"{hrs:.1f} hrs"
+
+
+# ======================================================================
+# Network workers (run on QThreads)
+# ======================================================================
+
+WIKI_API = "https://en.wikipedia.org/w/api.php"
+WIKI_REST = "https://en.wikipedia.org/api/rest_v1"
+SGDB_BASE = "https://www.steamgriddb.com/api/v2"
+
+
+def download_image(url: str, dest: Path, headers: dict | None = None) -> bool:
+    try:
+        h = {"User-Agent": USER_AGENT}
+        if headers:
+            h.update(headers)
+        r = requests.get(url, headers=h, timeout=30)
+        r.raise_for_status()
+        dest.write_bytes(r.content)
+        return True
+    except Exception:
+        return False
+
+
+def _img_ext(url: str) -> str:
+    ext = "." + url.rsplit(".", 1)[-1].split("?")[0][:4].lower()
+    return ext if ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp") else ".jpg"
+
+
+def wiki_find_page(query: str) -> str | None:
+    r = requests.get(WIKI_API, params={
+        "action": "query", "list": "search", "srsearch": query,
+        "srlimit": 1, "format": "json"},
+        headers={"User-Agent": USER_AGENT}, timeout=15)
+    r.raise_for_status()
+    hits = r.json().get("query", {}).get("search", [])
+    return hits[0]["title"] if hits else None
+
+
+def wiki_summary(title: str) -> dict:
+    slug = urllib.parse.quote(title.replace(" ", "_"), safe=":/_")
+    r = requests.get(f"{WIKI_REST}/page/summary/{slug}",
+                     headers={"User-Agent": USER_AGENT}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def sgdb_find_game(api_key: str, query: str) -> int | None:
+    r = requests.get(f"{SGDB_BASE}/search/autocomplete/{urllib.parse.quote(query)}",
+                     headers={"Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT},
+                     timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    return data[0]["id"] if data else None
+
+
+def sgdb_pick_cover(api_key: str, game_id: int) -> str | None:
+    r = requests.get(f"{SGDB_BASE}/grids/game/{game_id}",
+                     headers={"Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT},
+                     params={"dimensions": "600x900,342x482,660x930,512x800"}, timeout=15)
+    r.raise_for_status()
+    grids = r.json().get("data", [])
+    portrait = [g for g in grids if g.get("height", 0) > g.get("width", 0)] or grids
+    portrait.sort(key=lambda g: g.get("score", 0), reverse=True)
+    return portrait[0]["url"] if portrait else None
+
+
+class FetchWorker(QObject):
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, query: str, game_id: str, sgdb_key: str = ""):
+        super().__init__()
+        self.query, self.game_id, self.sgdb_key = query, game_id, sgdb_key.strip()
+
+    def run(self):
+        result = {"description": "", "art_path": "", "source": ""}
+        used, errors = [], []
+        try:
+            title = wiki_find_page(self.query)
+            if not title:
+                errors.append(f"No Wikipedia page for '{self.query}'.")
+            else:
+                summary = wiki_summary(title)
+                if summary.get("extract"):
+                    result["description"] = summary["extract"]
+                    used.append("Wikipedia")
+                img = summary.get("originalimage") or summary.get("thumbnail") or {}
+                url = img.get("source", "")
+                if url:
+                    dest = ART_DIR / f"{self.game_id}{_img_ext(url)}"
+                    if download_image(url, dest):
+                        result["art_path"] = str(dest)
+        except Exception as e:
+            errors.append(f"Wikipedia: {e}")
+
+        if self.sgdb_key:
+            try:
+                gid = sgdb_find_game(self.sgdb_key, self.query)
+                if gid is not None:
+                    cover = sgdb_pick_cover(self.sgdb_key, gid)
+                    if cover:
+                        dest = ART_DIR / f"{self.game_id}_sgdb{_img_ext(cover)}"
+                        if download_image(cover, dest):
+                            result["art_path"] = str(dest)
+                            used.append("SteamGridDB")
+            except Exception as e:
+                errors.append(f"SteamGridDB: {e}")
+
+        result["source"] = " + ".join(used)
+        if not used and not result["art_path"]:
+            self.failed.emit("; ".join(errors) or "No data found.")
+        else:
+            self.finished.emit(result)
+
+
+class UpdateWorker(QObject):
+    """Check the latest GitHub release tag for one or more games."""
+    one = pyqtSignal(str, str)        # game_id, latest_tag
+    done = pyqtSignal(int)            # number checked
+    failed = pyqtSignal(str)
+
+    def __init__(self, jobs: list[tuple[str, str]]):
+        super().__init__()
+        self.jobs = jobs              # [(game_id, repo)]
+
+    def run(self):
+        checked = 0
+        for game_id, repo in self.jobs:
+            try:
+                r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest",
+                                 headers={"User-Agent": USER_AGENT,
+                                          "Accept": "application/vnd.github+json"}, timeout=15)
+                if r.status_code == 404:
+                    continue
+                r.raise_for_status()
+                tag = r.json().get("tag_name", "")
+                if tag:
+                    self.one.emit(game_id, tag)
+                    checked += 1
+            except Exception:
+                continue
+        self.done.emit(checked)
+
+
+def pick_windows_asset(assets: list[dict]) -> dict | None:
+    """From a GitHub release's asset list, pick the best Windows download.
+
+    Prefers names mentioning windows/win64/win-x64/win32, then x64 over others,
+    then archives (.zip/.7z) or installers (.exe). Returns the asset dict
+    (with 'name' and 'browser_download_url') or None if nothing looks like Windows.
+    """
+    if not assets:
+        return None
+    win = re.compile(r"win(dows|64|32|-?x?64)?", re.IGNORECASE)
+    ok_ext = (".zip", ".7z", ".exe")
+    candidates = [a for a in assets
+                  if win.search(a.get("name", "")) and a.get("name", "").lower().endswith(ok_ext)]
+    if not candidates:
+        # some releases name the windows build generically; fall back to any archive
+        candidates = [a for a in assets if a.get("name", "").lower().endswith(ok_ext)
+                      and not re.search(r"(linux|mac|osx|android|flatpak|appimage|arm)",
+                                        a.get("name", ""), re.IGNORECASE)]
+    if not candidates:
+        return None
+
+    def score(a):
+        n = a.get("name", "").lower()
+        s = 0
+        if "x64" in n or "win64" in n or "x86_64" in n:
+            s += 3
+        if n.endswith(".zip"):
+            s += 2
+        elif n.endswith(".7z"):
+            s += 1
+        return s
+
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
+
+
+class DownloadWorker(QObject):
+    """Download the latest Windows release asset for a repo to a folder."""
+    progress = pyqtSignal(int)            # percent (0-100, -1 if unknown)
+    finished = pyqtSignal(str, str)       # saved_path, tag
+    failed = pyqtSignal(str)
+    no_asset = pyqtSignal(str, str)       # releases_url, tag  (fallback to browser)
+
+    def __init__(self, repo: str, dest_dir: str):
+        super().__init__()
+        self.repo = repo
+        self.dest_dir = dest_dir
+
+    def run(self):
+        try:
+            r = requests.get(f"https://api.github.com/repos/{self.repo}/releases/latest",
+                             headers={"User-Agent": USER_AGENT,
+                                      "Accept": "application/vnd.github+json"}, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            tag = data.get("tag_name", "")
+            asset = pick_windows_asset(data.get("assets", []))
+            if not asset:
+                self.no_asset.emit(data.get("html_url",
+                                   f"https://github.com/{self.repo}/releases"), tag)
+                return
+            url = asset["browser_download_url"]
+            dest = Path(self.dest_dir) / asset["name"]
+            with requests.get(url, headers={"User-Agent": USER_AGENT},
+                              stream=True, timeout=60) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                got = 0
+                with dest.open("wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                            got += len(chunk)
+                            if total:
+                                self.progress.emit(int(got * 100 / total))
+                            else:
+                                self.progress.emit(-1)
+            self.finished.emit(str(dest), tag)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+# ======================================================================
+# Grid model + delegate
+# ======================================================================
+
+class GameModel(QAbstractListModel):
+    """Holds the full library plus the currently-visible (filtered) subset.
+
+    Drag-drop reordering operates on the visible list and is only enabled when
+    no filter is active (so the persisted order is unambiguous).
+    """
+    reordered = pyqtSignal(str)       # game id that moved (to reselect)
+
+    MIME = "application/x-recomp-rows"
+
+    def __init__(self, games: list[dict]):
+        super().__init__()
+        self._all = games
+        self._visible = list(games)
+        self._search = ""
+        self._tag = None
+        self._fav_only = False
+        self.on_change = None         # callable() -> persist
+
+    # ----- filter -----
+    @property
+    def is_filtered(self) -> bool:
+        return bool(self._search) or self._tag is not None or self._fav_only
+
+    def set_filter(self, search: str = None, tag=..., fav_only: bool = None):
+        if search is not None:
+            self._search = search.strip().lower()
+        if tag is not ...:
+            self._tag = tag
+        if fav_only is not None:
+            self._fav_only = fav_only
+        self.beginResetModel()
+        self._recompute()
+        self.endResetModel()
+
+    def _recompute(self):
+        out = []
+        for g in self._all:
+            if self._fav_only and not g.get("favorite"):
+                continue
+            if self._tag is not None and self._tag not in g.get("tags", []):
+                continue
+            if self._search and self._search not in g.get("title", "").lower():
+                continue
+            out.append(g)
+        self._visible = out
+
+    # ----- data -----
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._visible)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        g = self._visible[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return g.get("title", "")
+        if role == ROLE_GAME:
+            return g
+        return None
+
+    def game_at(self, row: int) -> dict | None:
+        return self._visible[row] if 0 <= row < len(self._visible) else None
+
+    def row_of_id(self, gid: str) -> int:
+        for i, g in enumerate(self._visible):
+            if g["id"] == gid:
+                return i
+        return -1
+
+    def all_games(self) -> list[dict]:
+        return self._all
+
+    def refresh_all(self):
+        """Re-apply current filter and repaint (after external edits)."""
+        self.set_filter()
+
+    def add_game(self, g: dict):
+        self._all.append(g)
+        self.set_filter()
+        if self.on_change:
+            self.on_change()
+
+    def remove_id(self, gid: str):
+        self._all = [g for g in self._all if g["id"] != gid]
+        self.set_filter()
+        if self.on_change:
+            self.on_change()
+
+    # ----- drag & drop reordering -----
+    def flags(self, index):
+        base = super().flags(index)
+        if index.isValid():
+            return base | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
+        return base | Qt.ItemFlag.ItemIsDropEnabled
+
+    def supportedDropActions(self):
+        return Qt.DropAction.MoveAction
+
+    def mimeTypes(self):
+        return [self.MIME]
+
+    def mimeData(self, indexes):
+        rows = sorted({i.row() for i in indexes if i.isValid()})
+        md = QMimeData()
+        md.setData(self.MIME, QByteArray(",".join(str(r) for r in rows).encode()))
+        return md
+
+    def canDropMimeData(self, data, action, row, column, parent):
+        return data.hasFormat(self.MIME) and not self.is_filtered
+
+    def dropMimeData(self, data, action, row, column, parent):
+        if not data.hasFormat(self.MIME) or self.is_filtered:
+            return False
+        rows = [int(x) for x in bytes(data.data(self.MIME)).decode().split(",") if x != ""]
+        if not rows:
+            return False
+        if row < 0:
+            row = parent.row() if parent.isValid() else len(self._all)
+        moving = [self._all[r] for r in rows]
+        moved_id = moving[0]["id"]
+        for r in sorted(rows, reverse=True):
+            del self._all[r]
+        insert_at = row - sum(1 for r in rows if r < row)
+        insert_at = max(0, min(insert_at, len(self._all)))
+        for i, g in enumerate(moving):
+            self._all.insert(insert_at + i, g)
+        self.beginResetModel()
+        self._recompute()
+        self.endResetModel()
+        if self.on_change:
+            self.on_change()
+        self.reordered.emit(moved_id)
+        return False   # we handled the move; suppress default row removal
+
+
+class GameDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.scale = 1.0
+        self.now_playing: set[str] = set()
+        self.theme = THEMES["Dracula"]
+
+    def card_size(self) -> tuple[int, int]:
+        return int(BASE_CARD_W * self.scale), int(BASE_CARD_H * self.scale)
+
+    def sizeHint(self, option, index):
+        w, h = self.card_size()
+        return QSize(w + 16, h + 16)
+
+    def paint(self, painter, option, index):
+        g = index.data(ROLE_GAME)
+        if not g:
+            return
+        t = self.theme
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect.adjusted(8, 8, -8, -8)
+
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        # card background
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(t["surface"]))
+        painter.drawRoundedRect(QRectF(rect), 10, 10)
+
+        cw, ch = self.card_size()
+        title_h = int(34 * self.scale)
+        art_rect = QRect(rect.left() + 6, rect.top() + 6,
+                         rect.width() - 12, rect.height() - title_h - 12)
+        pm = art_for(g, art_rect.width(), art_rect.height())
+        painter.drawPixmap(art_rect.topLeft(), pm)
+
+        # title
+        painter.setPen(QColor(t["text"]))
+        f = QFont("Segoe UI", max(8, int(9 * self.scale))); f.setBold(True)
+        painter.setFont(f)
+        title_rect = QRect(rect.left() + 6, rect.bottom() - title_h,
+                           rect.width() - 12, title_h)
+        painter.drawText(title_rect, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+                         | int(Qt.TextFlag.TextWordWrap), g.get("title", ""))
+
+        # favorite star
+        if g.get("favorite"):
+            painter.setPen(QColor("#ffd43b"))
+            sf = QFont("Segoe UI", int(13 * self.scale))
+            painter.setFont(sf)
+            painter.drawText(art_rect.adjusted(0, 2, -4, 0),
+                             int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight), "★")
+
+        # now-playing badge
+        if g["id"] in self.now_playing:
+            badge = QRect(art_rect.left() + 4, art_rect.top() + 4, int(74 * self.scale), int(20 * self.scale))
+            painter.setBrush(QColor(t["play"]))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(badge, 6, 6)
+            painter.setPen(QColor(t["play_text"]))
+            bf = QFont("Segoe UI", int(7 * self.scale)); bf.setBold(True)
+            painter.setFont(bf)
+            painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), "● PLAYING")
+
+        # playtime badge (bottom-left of art) if any playtime
+        elif g.get("playtime_seconds", 0) >= 60:
+            txt = fmt_playtime(g["playtime_seconds"])
+            bf = QFont("Segoe UI", int(7 * self.scale)); bf.setBold(True)
+            fm2 = QFontMetrics(bf)
+            bw = fm2.horizontalAdvance(txt) + 12
+            badge = QRect(art_rect.left() + 4, art_rect.bottom() - int(20 * self.scale) - 2,
+                          bw, int(18 * self.scale))
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(badge, 6, 6)
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(bf)
+            painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), txt)
+
+        # update-available badge (top-right of art)
+        inst = g.get("installed_version", "")
+        latest = g.get("latest_version", "")
+        if inst and latest and inst != latest:
+            bf = QFont("Segoe UI", int(7 * self.scale)); bf.setBold(True)
+            fm3 = QFontMetrics(bf)
+            txt = "⬆ UPDATE"
+            bw = fm3.horizontalAdvance(txt) + 12
+            badge = QRect(art_rect.right() - bw - 4, art_rect.top() + 4,
+                          bw, int(18 * self.scale))
+            painter.setBrush(QColor(t["accent"]))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(badge, 6, 6)
+            painter.setPen(QColor(t["accent_text"]))
+            painter.setFont(bf)
+            painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), txt)
+
+        # border (selected / hover)
+        if selected:
+            painter.setPen(QPen(QColor(t["accent"]), 2))
+        elif hover:
+            painter.setPen(QPen(QColor(t["subtext"]), 2))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+        if selected or hover:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(rect.adjusted(1, 1, -1, -1)), 10, 10)
+        painter.restore()
+
+
+class GameGrid(QListView):
+    """Icon-mode list view with reordering + Enter-to-activate."""
+    activateGame = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("grid")
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setMovement(QListView.Movement.Static)
+        self.setFlow(QListView.Flow.LeftToRight)
+        self.setWrapping(True)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setSpacing(6)
+        self.setUniformItemSizes(True)
+        self.setMouseTracking(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.activateGame.emit()
+            return
+        super().keyPressEvent(e)
+
+
+# ======================================================================
+# Custom widgets
+# ======================================================================
+
+class HeroBanner(QWidget):
+    """Wide banner painting cover-cropped art behind a gradient + title."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(190)
+        self._pm = QPixmap()
+        self._title = ""
+        self._sub = ""
+        self.theme = THEMES["Dracula"]
+
+    def set_game(self, game: dict | None):
+        if not game:
+            self._pm = QPixmap(); self._title = ""; self._sub = ""
+        else:
+            banner = game.get("banner_path", "")
+            src = QPixmap(banner) if banner and Path(banner).exists() else raw_art(game)
+            self._pm = src
+            self._title = game.get("title", "")
+            bits = [b for b in (game.get("platform", ""),
+                                str(game.get("released", ""))[:4],
+                                game.get("genres", "")) if b]
+            self._sub = "   •   ".join(bits)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = self.theme
+        r = self.rect()
+        p.fillRect(r, QColor(t["surface2"]))
+        if not self._pm.isNull():
+            scaled = self._pm.scaled(r.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                     Qt.TransformationMode.SmoothTransformation)
+            x = (r.width() - scaled.width()) // 2
+            y = (r.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        # gradient overlay (transparent top -> opaque bottom)
+        grad = QLinearGradient(0, 0, 0, r.height())
+        c = QColor(t["surface"])
+        c0 = QColor(c); c0.setAlpha(40)
+        c1 = QColor(c); c1.setAlpha(140)
+        c2 = QColor(c); c2.setAlpha(245)
+        grad.setColorAt(0.0, c0); grad.setColorAt(0.55, c1); grad.setColorAt(1.0, c2)
+        p.fillRect(r, QBrush(grad))
+        # title
+        p.setPen(QColor(t["text"]))
+        tf = QFont("Segoe UI", 17); tf.setBold(True)
+        p.setFont(tf)
+        p.drawText(r.adjusted(16, 0, -16, -34),
+                   int(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+                   | int(Qt.TextFlag.TextWordWrap), self._title or "—")
+        p.setPen(QColor(t["accent"]))
+        sf = QFont("Segoe UI", 10)
+        p.setFont(sf)
+        p.drawText(r.adjusted(16, 0, -16, -12),
+                   int(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft), self._sub)
+        p.end()
+
+
+class Toast(QFrame):
+    """Transient bottom-right notification with slide+fade."""
+    def __init__(self, parent, text: str, accent: str):
+        super().__init__(parent)
+        self.setObjectName("toast")
+        self.setStyleSheet(
+            f"#toast {{ background: {accent}; border-radius: 10px; }}"
+            f"QLabel {{ color: #1e1f29; font-weight: 600; background: transparent; }}")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+        self.adjustSize()
+        self.setFixedWidth(300)
+        self.adjustSize()
+
+    def show_at(self, parent_rect: QRect):
+        margin = 24
+        end_x = parent_rect.width() - self.width() - margin
+        end_y = parent_rect.height() - self.height() - margin
+        self.move(end_x, end_y + 40)
+        self.show()
+        self.raise_()
+        self._anim_in = QPropertyAnimation(self, b"pos")
+        self._anim_in.setDuration(280)
+        self._anim_in.setStartValue(QPoint(end_x, end_y + 40))
+        self._anim_in.setEndValue(QPoint(end_x, end_y))
+        self._anim_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_in.start()
+        QTimer.singleShot(3200, self._fade_out)
+
+    def _fade_out(self):
+        eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(eff)
+        self._anim_out = QPropertyAnimation(eff, b"opacity")
+        self._anim_out.setDuration(400)
+        self._anim_out.setStartValue(1.0)
+        self._anim_out.setEndValue(0.0)
+        self._anim_out.finished.connect(self.deleteLater)
+        self._anim_out.start()
+
+
+class ScreenshotStrip(QScrollArea):
+    """Horizontal strip of screenshot thumbnails; click opens full-size."""
+    def __init__(self):
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setFixedHeight(110)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self._inner = QWidget()
+        self._lay = QHBoxLayout(self._inner)
+        self._lay.setContentsMargins(4, 4, 4, 4)
+        self._lay.setSpacing(8)
+        self._lay.addStretch()
+        self.setWidget(self._inner)
+        self._empty = QLabel("No screenshots yet. Use “Add Screenshot…”.")
+
+    def set_shots(self, paths: list[str]):
+        while self._lay.count():
+            it = self._lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        valid = [p for p in paths if Path(p).exists()]
+        if not valid:
+            lbl = QLabel("No screenshots yet — use “Add Screenshot…”.")
+            lbl.setStyleSheet("color: #6272a4;")
+            self._lay.addWidget(lbl)
+            self._lay.addStretch()
+            return
+        for p in valid:
+            thumb = QLabel()
+            pm = QPixmap(p).scaled(160, 90, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            thumb.setPixmap(pm)
+            thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+            thumb.mousePressEvent = (lambda e, path=p: self._open(path))
+            self._lay.addWidget(thumb)
+        self._lay.addStretch()
+
+    def _open(self, path: str):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Screenshot")
+        v = QVBoxLayout(dlg)
+        lbl = QLabel()
+        pm = QPixmap(path).scaled(1100, 700, Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+        lbl.setPixmap(pm)
+        v.addWidget(lbl)
+        dlg.exec()
+
+
+# ======================================================================
+# Dialogs
+# ======================================================================
+
+class EditGameDialog(QDialog):
+    def __init__(self, parent, game: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Game")
+        self.game = dict(game)
+        self.setMinimumWidth(560)
+
+        self.title_edit = QLineEdit(game.get("title", ""))
+        self.platform_edit = QLineEdit(game.get("platform", ""))
+
+        self.exe_edit = QLineEdit(game.get("exe_path", ""))
+        exe_btn = QPushButton("Browse…"); exe_btn.clicked.connect(self._browse_exe)
+        exe_wrap = self._row(self.exe_edit, exe_btn)
+
+        self.args_edit = QLineEdit(game.get("args", ""))
+        self.released_edit = QLineEdit(str(game.get("released", "")))
+        self.genres_edit = QLineEdit(game.get("genres", ""))
+        self.tags_edit = QLineEdit(", ".join(game.get("tags", [])))
+        self.repo_edit = QLineEdit(game.get("github_repo", ""))
+        self.repo_edit.setPlaceholderText("owner/repo  (for update checks)")
+        self.version_edit = QLineEdit(game.get("installed_version", ""))
+
+        self.art_edit = QLineEdit(game.get("art_path", ""))
+        art_btn = QPushButton("Browse…"); art_btn.clicked.connect(self._browse_art)
+        art_url = QPushButton("URL…"); art_url.clicked.connect(self._art_from_url)
+        art_wrap = self._row(self.art_edit, art_btn, art_url)
+
+        self.search_edit = QLineEdit(game.get("search_name") or game.get("title", ""))
+
+        self.profiles_edit = QTextEdit()
+        self.profiles_edit.setPlaceholderText("One per line:  Name | --some-flag --other")
+        self.profiles_edit.setText(
+            "\n".join(f"{p.get('name','')} | {p.get('args','')}" for p in game.get("profiles", [])))
+        self.profiles_edit.setFixedHeight(70)
+
+        self.desc_edit = QTextEdit(game.get("description", ""))
+        self.desc_edit.setMinimumHeight(110)
+
+        form = QFormLayout()
+        form.addRow("Title:", self.title_edit)
+        form.addRow("Platform / Port:", self.platform_edit)
+        form.addRow("Executable:", exe_wrap)
+        form.addRow("Arguments:", self.args_edit)
+        form.addRow("Launch profiles:", self.profiles_edit)
+        form.addRow("Release year:", self.released_edit)
+        form.addRow("Genres:", self.genres_edit)
+        form.addRow("Tags (comma sep):", self.tags_edit)
+        form.addRow("GitHub repo:", self.repo_edit)
+        form.addRow("Installed version:", self.version_edit)
+        form.addRow("Box art file:", art_wrap)
+        form.addRow("Search name:", self.search_edit)
+        form.addRow("Description:", self.desc_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        v = QVBoxLayout(self)
+        v.addLayout(form)
+        v.addWidget(btns)
+
+    @staticmethod
+    def _row(*widgets) -> QWidget:
+        w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0)
+        for x in widgets:
+            h.addWidget(x)
+        return w
+
+    def _browse_exe(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select game executable", "",
+                                              "Executables (*.exe);;All files (*.*)")
+        if path:
+            self.exe_edit.setText(path)
+
+    def _browse_art(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select box art", "",
+                                              "Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
+        if path:
+            self.art_edit.setText(path)
+
+    def _art_from_url(self):
+        url, ok = QInputDialog.getText(self, "Box art from URL", "Direct image URL:")
+        url = url.strip()
+        if not ok or not url:
+            return
+        dest = ART_DIR / f"{self.game['id']}_url{_img_ext(url)}"
+        if download_image(url, dest):
+            self.art_edit.setText(str(dest))
+        else:
+            QMessageBox.warning(self, "Download failed", "Could not download that URL.")
+
+    def result_game(self) -> dict:
+        profiles = []
+        for line in self.profiles_edit.toPlainText().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "|" in line:
+                name, args = line.split("|", 1)
+            else:
+                name, args = line, ""
+            profiles.append({"name": name.strip(), "args": args.strip()})
+        tags = [t.strip() for t in self.tags_edit.text().split(",") if t.strip()]
+        self.game.update({
+            "title": self.title_edit.text().strip(),
+            "platform": self.platform_edit.text().strip(),
+            "exe_path": self.exe_edit.text().strip(),
+            "args": self.args_edit.text().strip(),
+            "released": self.released_edit.text().strip(),
+            "genres": self.genres_edit.text().strip(),
+            "tags": tags,
+            "github_repo": self.repo_edit.text().strip(),
+            "installed_version": self.version_edit.text().strip(),
+            "art_path": self.art_edit.text().strip(),
+            "search_name": self.search_edit.text().strip(),
+            "description": self.desc_edit.toPlainText().strip(),
+            "profiles": profiles,
+        })
+        return self.game
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent, settings: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.settings = dict(settings)
+        self.setMinimumWidth(540)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(THEMES.keys()))
+        self.theme_combo.setCurrentText(settings.get("theme", "Dracula"))
+
+        self.sgdb_edit = QLineEdit(settings.get("sgdb_api_key", ""))
+        self.sgdb_edit.setPlaceholderText("Optional — premium hand-picked covers")
+
+        self.tray_check = QCheckBox("Minimize to system tray instead of quitting")
+        self.tray_check.setChecked(settings.get("minimize_to_tray", False))
+
+        self.launch_check = QCheckBox("Check for updates on launch")
+        self.launch_check.setChecked(settings.get("check_updates_on_launch", True))
+
+        info = QLabel(
+            "<b>Fetch Info</b> uses <a href='https://en.wikipedia.org'>Wikipedia</a> "
+            "for descriptions and box art — no setup needed.<br>"
+            "For curated cover art, paste a free "
+            "<a href='https://www.steamgriddb.com/profile/preferences/api'>SteamGridDB API key</a>.")
+        info.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Theme:", self.theme_combo)
+        form.addRow("SteamGridDB key:", self.sgdb_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        v = QVBoxLayout(self)
+        v.addWidget(info)
+        v.addLayout(form)
+        v.addWidget(self.tray_check)
+        v.addWidget(self.launch_check)
+        v.addWidget(btns)
+
+    def result_settings(self) -> dict:
+        self.settings["theme"] = self.theme_combo.currentText()
+        self.settings["sgdb_api_key"] = self.sgdb_edit.text().strip()
+        self.settings["minimize_to_tray"] = self.tray_check.isChecked()
+        self.settings["check_updates_on_launch"] = self.launch_check.isChecked()
+        return self.settings
+
+
+class ScanDialog(QDialog):
+    """Pick a folder; show found .exe files as a checklist to import."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Scan folder for games")
+        self.setMinimumSize(560, 460)
+        self.found: list[tuple[str, str]] = []   # (display_name, exe_path)
+
+        top = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Choose a folder containing your recomp games…")
+        browse = QPushButton("Browse…"); browse.clicked.connect(self._browse)
+        scan = QPushButton("Scan"); scan.clicked.connect(self._scan)
+        top.addWidget(self.path_edit); top.addWidget(browse); top.addWidget(scan)
+
+        self.list = QListWidget()
+        self.status = QLabel("")
+        self.fetch_check = QCheckBox("Fetch art && info for recognized games after import")
+        self.fetch_check.setChecked(True)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Add selected")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        v = QVBoxLayout(self)
+        v.addLayout(top)
+        v.addWidget(self.list, 1)
+        v.addWidget(self.status)
+        v.addWidget(self.fetch_check)
+        v.addWidget(btns)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Select games folder")
+        if d:
+            self.path_edit.setText(d)
+            self._scan()
+
+    def _scan(self):
+        root = Path(self.path_edit.text().strip())
+        self.list.clear()
+        if not root.exists():
+            self.status.setText("Folder not found.")
+            return
+        exes = []
+        for p in root.rglob("*.exe"):
+            if SCAN_BLACKLIST.search(p.name):
+                continue
+            exes.append(p)
+        recognized = 0
+        for p in sorted(exes):
+            match = identify_exe(str(p))
+            if match:
+                recognized += 1
+                name = match["title"]
+                label = f"✓  {match['title']}   ·   {match['platform']}   —   {p.name}"
+            else:
+                # heuristic name: prefer parent folder name, else exe stem
+                name = p.parent.name if p.parent != root else p.stem
+                label = f"?  {name}   —   {p}"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, (name, str(p), match))
+            self.list.addItem(item)
+        self.status.setText(
+            f"Found {len(exes)} executable(s) — {recognized} auto-recognized, "
+            f"{len(exes) - recognized} unknown.")
+
+    def selected(self) -> list[tuple]:
+        """Return [(name, exe_path, match_or_None), ...] for checked rows."""
+        out = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                out.append(it.data(Qt.ItemDataRole.UserRole))
+        return out
+
+
+class IdentifyDialog(QDialog):
+    """Review proposed auto-identifications for existing library games."""
+    def __init__(self, parent, candidates: list[tuple[dict, dict]]):
+        super().__init__(parent)
+        self.setWindowTitle("Identify games")
+        self.setMinimumSize(560, 420)
+
+        intro = QLabel(
+            "These games match known recomps by their executable. "
+            "Check the ones you want to relabel:")
+        intro.setWordWrap(True)
+
+        self.list = QListWidget()
+        for g, match in candidates:
+            cur = g.get("title") or Path(g.get("exe_path", "")).name
+            item = QListWidgetItem(f"{cur}   →   {match['title']}   ·   {match['platform']}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, (g, match))
+            self.list.addItem(item)
+
+        self.fetch_check = QCheckBox("Fetch art && info for identified games")
+        self.fetch_check.setChecked(True)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Apply")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        v = QVBoxLayout(self)
+        v.addWidget(intro)
+        v.addWidget(self.list, 1)
+        v.addWidget(self.fetch_check)
+        v.addWidget(btns)
+
+    def selected(self) -> list[tuple[dict, dict]]:
+        out = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                out.append(it.data(Qt.ItemDataRole.UserRole))
+        return out
+
+
+# ======================================================================
+# Main window
+# ======================================================================
+
+class LauncherWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(app_icon())
+        self.resize(1280, 820)
+
+        self.settings = load_settings()
+        self.theme = THEMES.get(self.settings["theme"], THEMES["Dracula"])
+        self.games = load_library()
+        self.model = GameModel(self.games)
+        self.model.on_change = self._persist
+        self.model.reordered.connect(self._select_id)
+
+        self.selected_id: str | None = None
+        self.running: dict[str, tuple] = {}   # id -> (Popen, start_monotonic)
+        self._threads = []                    # keep refs alive
+
+        self._build_ui()
+        self._build_tray()
+        self._build_shortcuts()
+        self.apply_theme()
+
+        self.delegate.scale = self.settings["card_scale"] / 100.0
+        self.zoom_slider.setValue(self.settings["card_scale"])
+
+        # process-watch timer
+        self._proc_timer = QTimer(self)
+        self._proc_timer.timeout.connect(self._poll_processes)
+        self._proc_timer.start(1000)
+
+        self.rebuild_sidebar()
+        if self.model.rowCount() > 0:
+            self.grid.setCurrentIndex(self.model.index(0, 0))
+            self._select_row(0)
+
+        if self.settings.get("check_updates_on_launch", True):
+            QTimer.singleShot(1500, self.check_updates_quiet)
+
+    # ---------------- UI ----------------
+    def _build_ui(self):
+        tb = QToolBar(); tb.setMovable(False)
+        self.addToolBar(tb)
+        self._act(tb, "➕  Add", self.add_game)
+        self._act(tb, "📁  Scan Folder", self.scan_folder)
+        self._act(tb, "🪄  Identify", self.identify_library)
+        self._act(tb, "🌐  Fetch Info", self.fetch_selected)
+        self._act(tb, "✎  Edit", self.edit_selected)
+        self._act(tb, "🗑  Remove", self.remove_selected)
+        tb.addSeparator()
+        self._act(tb, "⬆  Check Updates", self.check_updates_all)
+        tb.addSeparator()
+        self._act(tb, "⚙  Settings", self.open_settings)
+
+        # search box on the toolbar (right-aligned)
+        spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search…  (Ctrl+F)")
+        self.search_edit.setFixedWidth(220)
+        self.search_edit.textChanged.connect(self._on_search)
+        tb.addWidget(self.search_edit)
+
+        self.setStatusBar(QStatusBar())
+
+        central = QWidget(); self.setCentralWidget(central)
+        root = QHBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+
+        # sidebar
+        self.sidebar = QListWidget(); self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(180)
+        self.sidebar.currentRowChanged.connect(self._on_sidebar)
+        root.addWidget(self.sidebar)
+
+        # grid
+        grid_wrap = QWidget(); gv = QVBoxLayout(grid_wrap)
+        gv.setContentsMargins(0, 0, 0, 0); gv.setSpacing(0)
+        self.grid = GameGrid()
+        self.delegate = GameDelegate(self.grid)
+        self.grid.setItemDelegate(self.delegate)
+        self.grid.setModel(self.model)
+        self.grid.selectionModel().currentChanged.connect(
+            lambda cur, prev: self._select_row(cur.row()))
+        self.grid.doubleClicked.connect(lambda i: self.play_selected())
+        self.grid.activateGame.connect(self.play_selected)
+        gv.addWidget(self.grid, 1)
+
+        # zoom bar
+        zbar = QWidget(); zl = QHBoxLayout(zbar); zl.setContentsMargins(12, 4, 12, 8)
+        zl.addStretch()
+        zl.addWidget(QLabel("Card size"))
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(70, 160)
+        self.zoom_slider.setFixedWidth(160)
+        self.zoom_slider.valueChanged.connect(self._on_zoom)
+        zl.addWidget(self.zoom_slider)
+        gv.addWidget(zbar)
+        root.addWidget(grid_wrap, 1)
+
+        # details panel
+        self.details = self._build_details()
+        root.addWidget(self.details)
+
+    def _build_details(self) -> QWidget:
+        panel = QFrame(); panel.setObjectName("detailsPanel")
+        panel.setMinimumWidth(380); panel.setMaximumWidth(460)
+        v = QVBoxLayout(panel); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
+
+        self.hero = HeroBanner()
+        v.addWidget(self.hero)
+
+        body = QWidget(); bl = QVBoxLayout(body)
+        bl.setContentsMargins(18, 14, 18, 14); bl.setSpacing(10)
+
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet("color: #6272a4;")
+        bl.addWidget(self.stats_label)
+
+        self.tabs = QTabWidget()
+        # About
+        self.about_text = QTextEdit(); self.about_text.setReadOnly(True)
+        self.about_text.setStyleSheet("background: transparent; border: 0;")
+        self.tabs.addTab(self.about_text, "About")
+        # Screenshots
+        shots_tab = QWidget(); sl = QVBoxLayout(shots_tab); sl.setContentsMargins(0, 8, 0, 0)
+        self.shots = ScreenshotStrip()
+        add_shot = QPushButton("Add Screenshot…"); add_shot.clicked.connect(self.add_screenshot)
+        sl.addWidget(self.shots); sl.addWidget(add_shot); sl.addStretch()
+        self.tabs.addTab(shots_tab, "Screenshots")
+        # Info
+        info_tab = QWidget(); il = QFormLayout(info_tab); il.setContentsMargins(4, 10, 4, 4)
+        self.info_exe = QLabel("—"); self.info_exe.setWordWrap(True)
+        self.info_repo = QLabel("—"); self.info_repo.setOpenExternalLinks(True)
+        self.info_update = QLabel("—")
+        il.addRow("Executable:", self.info_exe)
+        il.addRow("GitHub:", self.info_repo)
+        il.addRow("Updates:", self.info_update)
+        self.tabs.addTab(info_tab, "Info")
+        bl.addWidget(self.tabs, 1)
+
+        # profile + play row
+        play_row = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(110)
+        play_row.addWidget(self.profile_combo)
+        self.fav_btn = QPushButton("☆")
+        self.fav_btn.setFixedWidth(44)
+        self.fav_btn.setToolTip("Toggle favorite (Space)")
+        self.fav_btn.clicked.connect(self.toggle_favorite)
+        play_row.addWidget(self.fav_btn)
+        bl.addLayout(play_row)
+
+        self.download_btn = QPushButton("⬇  Get Latest Release")
+        self.download_btn.setToolTip("Download the newest build from GitHub")
+        self.download_btn.clicked.connect(self.download_latest)
+        bl.addWidget(self.download_btn)
+
+        self.play_btn = QPushButton("▶  Play")
+        self.play_btn.setObjectName("playButton")
+        self.play_btn.setMinimumHeight(46)
+        self.play_btn.clicked.connect(self.play_selected)
+        bl.addWidget(self.play_btn)
+
+        v.addWidget(body, 1)
+        return panel
+
+    def _act(self, tb, text, slot):
+        a = QAction(text, self); a.triggered.connect(slot); tb.addAction(a); return a
+
+    def _build_tray(self):
+        self.tray = QSystemTrayIcon(app_icon(), self)
+        self.tray.setToolTip(APP_NAME)
+        menu = QMenu()
+        show_a = menu.addAction("Show"); show_a.triggered.connect(self._restore)
+        menu.addSeparator()
+        quit_a = menu.addAction("Quit"); quit_a.triggered.connect(self._quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self._restore() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
+        self.tray.show()
+
+    def _build_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.search_edit.setFocus())
+        QShortcut(QKeySequence("F2"), self, activated=self.edit_selected)
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self, activated=self.remove_selected)
+        QShortcut(QKeySequence("Ctrl+,"), self, activated=self.open_settings)
+        QShortcut(QKeySequence("Space"), self, activated=self.toggle_favorite)
+        QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.zoom_slider.setValue(self.zoom_slider.value() + 10))
+        QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.zoom_slider.setValue(self.zoom_slider.value() - 10))
+
+    # ---------------- theme ----------------
+    def apply_theme(self):
+        self.theme = THEMES.get(self.settings["theme"], THEMES["Dracula"])
+        self.setStyleSheet(build_stylesheet(self.theme))
+        self.delegate.theme = self.theme
+        self.hero.theme = self.theme
+        self.grid.viewport().update()
+
+    # ---------------- sidebar ----------------
+    def rebuild_sidebar(self):
+        cur = self.sidebar.currentRow()
+        self.sidebar.blockSignals(True)
+        self.sidebar.clear()
+        QListWidgetItem("🎮  All Games", self.sidebar).setData(Qt.ItemDataRole.UserRole, ("all", None))
+        QListWidgetItem("★  Favorites", self.sidebar).setData(Qt.ItemDataRole.UserRole, ("fav", None))
+        tags = sorted({t for g in self.games for t in g.get("tags", [])})
+        if tags:
+            hdr = QListWidgetItem("— Tags —", self.sidebar)
+            hdr.setFlags(Qt.ItemFlag.NoItemFlags)
+            for t in tags:
+                QListWidgetItem(f"🏷  {t}", self.sidebar).setData(Qt.ItemDataRole.UserRole, ("tag", t))
+        self.sidebar.blockSignals(False)
+        if cur < 0:
+            cur = 0
+        self.sidebar.setCurrentRow(min(cur, self.sidebar.count() - 1))
+
+    def _on_sidebar(self, row: int):
+        item = self.sidebar.item(row)
+        if not item:
+            return
+        kind, val = item.data(Qt.ItemDataRole.UserRole) or ("all", None)
+        if kind == "all":
+            self.model.set_filter(tag=None, fav_only=False)
+        elif kind == "fav":
+            self.model.set_filter(tag=None, fav_only=True)
+        elif kind == "tag":
+            self.model.set_filter(tag=val, fav_only=False)
+        self._update_drag_state()
+        if self.model.rowCount() > 0:
+            self.grid.setCurrentIndex(self.model.index(0, 0))
+
+    def _on_search(self, text: str):
+        self.model.set_filter(search=text)
+        self._update_drag_state()
+
+    def _update_drag_state(self):
+        draggable = not self.model.is_filtered
+        self.grid.setDragEnabled(draggable)
+        self.grid.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove
+                                  if draggable else QAbstractItemView.DragDropMode.NoDragDrop)
+
+    # ---------------- zoom ----------------
+    def _on_zoom(self, value: int):
+        self.delegate.scale = value / 100.0
+        self.settings["card_scale"] = value
+        save_settings(self.settings)
+        self.grid.reset()
+        self.grid.scheduleDelayedItemsLayout()
+        if self.selected_id:
+            self._select_id(self.selected_id)
+
+    # ---------------- selection / details ----------------
+    def _select_row(self, row: int):
+        g = self.model.game_at(row)
+        if g:
+            self.selected_id = g["id"]
+            self._render_details(g)
+
+    def _select_id(self, gid: str):
+        row = self.model.row_of_id(gid)
+        if row >= 0:
+            self.grid.setCurrentIndex(self.model.index(row, 0))
+            self._select_row(row)
+
+    def _game(self, gid: str) -> dict | None:
+        for g in self.games:
+            if g["id"] == gid:
+                return g
+        return None
+
+    def _render_details(self, g: dict):
+        self.hero.set_game(g)
+        # stats
+        bits = []
+        if g.get("playtime_seconds", 0) >= 1:
+            bits.append(f"⏱ {fmt_playtime(g['playtime_seconds'])}")
+        if g.get("launch_count"):
+            bits.append(f"▶ {g['launch_count']} launches")
+        if g.get("last_played"):
+            bits.append(f"Last: {g['last_played']}")
+        self.stats_label.setText("    ".join(bits) or "Never played")
+        # about
+        self.about_text.setPlainText(
+            g.get("description") or "No description yet. Click “Fetch Info” to pull from Wikipedia.")
+        # screenshots
+        self.shots.set_shots(g.get("screenshots", []))
+        # info tab
+        self.info_exe.setText(g.get("exe_path") or "— not set —")
+        repo = g.get("github_repo", "")
+        if repo:
+            self.info_repo.setText(f"<a href='https://github.com/{repo}'>{repo}</a>")
+        else:
+            self.info_repo.setText("—")
+        self._render_update_label(g)
+        # profiles
+        self.profile_combo.clear()
+        self.profile_combo.addItem("Default")
+        for p in g.get("profiles", []):
+            self.profile_combo.addItem(p.get("name", "?"))
+        # favorite button
+        self.fav_btn.setText("★" if g.get("favorite") else "☆")
+        # download button (needs a repo)
+        self.download_btn.setEnabled(bool(g.get("github_repo")))
+        # play / stop button
+        self._update_play_button(g)
+
+    def _render_update_label(self, g: dict):
+        latest = g.get("latest_version", "")
+        installed = g.get("installed_version", "")
+        if not g.get("github_repo"):
+            self.info_update.setText("— (no repo set)")
+        elif not latest:
+            self.info_update.setText("Not checked yet")
+        elif installed and latest != installed:
+            self.info_update.setText(f"⬆ Update available: {latest} (you have {installed})")
+        elif installed:
+            self.info_update.setText(f"✓ Up to date ({installed})")
+        else:
+            self.info_update.setText(f"Latest release: {latest}")
+
+    def _update_play_button(self, g: dict):
+        if g["id"] in self.running:
+            self.play_btn.setText("■  Stop")
+            self.play_btn.setObjectName("stopButton")
+            self.play_btn.setEnabled(True)
+        else:
+            playable = bool(g.get("exe_path") and Path(g["exe_path"]).exists())
+            self.play_btn.setText("▶  Play" if playable else "▶  Set executable to play")
+            self.play_btn.setObjectName("playButton")
+            self.play_btn.setEnabled(playable)
+        self.play_btn.style().unpolish(self.play_btn)
+        self.play_btn.style().polish(self.play_btn)
+
+    # ---------------- actions ----------------
+    def add_game(self):
+        title, ok = QInputDialog.getText(self, "Add Game", "Game title:")
+        if not ok or not title.strip():
+            return
+        g = blank_game(title.strip())
+        self.model.add_game(g)
+        self.rebuild_sidebar()
+        self._select_id(g["id"])
+        self.edit_selected()
+
+    @staticmethod
+    def _apply_match(g: dict, match: dict):
+        """Fill a game's metadata from a KNOWN_RECOMPS entry."""
+        g["title"] = match["title"]
+        g["platform"] = match["platform"]
+        g["search_name"] = match["search"]
+        g["github_repo"] = match.get("github_repo", "")
+        g["tags"] = list(match.get("tags", []))
+
+    def scan_folder(self):
+        dlg = ScanDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        added = 0
+        recognized_ids = []
+        for name, exe, match in dlg.selected():
+            # skip if exe already in library
+            if any(x.get("exe_path") == exe for x in self.games):
+                continue
+            g = blank_game(name)
+            g["exe_path"] = exe
+            if match:
+                self._apply_match(g, match)
+                recognized_ids.append(g["id"])
+            self.games.append(g)
+            added += 1
+        if added:
+            self.model.refresh_all()
+            self._persist()
+            self.rebuild_sidebar()
+            self.toast(f"Added {added} game(s) — {len(recognized_ids)} auto-recognized.")
+            if recognized_ids and dlg.fetch_check.isChecked():
+                self._queue_fetches(recognized_ids)
+        else:
+            self.toast("No new games added.")
+
+    def identify_library(self):
+        """Run the fingerprint DB over existing games and offer to apply fixes."""
+        candidates = []
+        for g in self.games:
+            exe = g.get("exe_path", "")
+            if not exe:
+                continue
+            match = identify_exe(exe)
+            if match and match["title"] != g.get("title"):
+                candidates.append((g, match))
+        if not candidates:
+            self.toast("Nothing to identify — every game with an exe is already labeled.")
+            return
+        dlg = IdentifyDialog(self, candidates)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        changed_ids = []
+        for g, match in dlg.selected():
+            self._apply_match(g, match)
+            changed_ids.append(g["id"])
+        if changed_ids:
+            _PIX_CACHE.clear()
+            self.model.refresh_all()
+            self._persist()
+            self.rebuild_sidebar()
+            if self.selected_id:
+                self._select_id(self.selected_id)
+            self.toast(f"Identified {len(changed_ids)} game(s).")
+            if dlg.fetch_check.isChecked():
+                self._queue_fetches(changed_ids)
+
+    def edit_selected(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        dlg = EditGameDialog(self, g)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            updated = dlg.result_game()
+            for i, x in enumerate(self.games):
+                if x["id"] == updated["id"]:
+                    self.games[i] = updated
+                    break
+            _PIX_CACHE.clear()
+            self.model.refresh_all()
+            self._persist()
+            self.rebuild_sidebar()
+            self._select_id(updated["id"])
+
+    def remove_selected(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        if QMessageBox.question(
+                self, "Remove game",
+                f"Remove '{g['title']}' from the launcher?\n(The game files are NOT deleted.)"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.model.remove_id(self.selected_id)
+        self.games = self.model.all_games()
+        self.rebuild_sidebar()
+        if self.model.rowCount() > 0:
+            self.grid.setCurrentIndex(self.model.index(0, 0))
+            self._select_row(0)
+        else:
+            self.selected_id = None
+            self.hero.set_game(None)
+            self.about_text.clear()
+            self.stats_label.setText("")
+            self.play_btn.setEnabled(False)
+
+    def toggle_favorite(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        g["favorite"] = not g.get("favorite")
+        self.fav_btn.setText("★" if g["favorite"] else "☆")
+        self._persist()
+        self.model.refresh_all()
+        self._select_id(self.selected_id)
+
+    def add_screenshot(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add screenshots", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if not paths:
+            return
+        dest_dir = SHOTS_DIR / g["id"]
+        dest_dir.mkdir(exist_ok=True)
+        for p in paths:
+            src = Path(p)
+            dest = dest_dir / src.name
+            try:
+                shutil.copy2(src, dest)
+                g.setdefault("screenshots", []).append(str(dest))
+            except Exception:
+                pass
+        self._persist()
+        self.shots.set_shots(g.get("screenshots", []))
+
+    # ---------------- launching ----------------
+    def play_selected(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        if g["id"] in self.running:
+            self._stop_game(g)
+            return
+        exe = g.get("exe_path", "")
+        if not exe or not Path(exe).exists():
+            QMessageBox.warning(self, "Cannot launch", "Set the executable path first (Edit / F2).")
+            return
+        # resolve profile args
+        args_str = g.get("args", "")
+        idx = self.profile_combo.currentIndex()
+        if idx > 0:
+            prof = g.get("profiles", [])[idx - 1]
+            args_str = prof.get("args", "")
+        args = args_str.split() if args_str else []
+        try:
+            proc = subprocess.Popen([exe, *args], cwd=str(Path(exe).parent))
+        except Exception as e:
+            QMessageBox.critical(self, "Launch failed", str(e))
+            return
+        self.running[g["id"]] = (proc, time.monotonic())
+        self.delegate.now_playing.add(g["id"])
+        g["launch_count"] = g.get("launch_count", 0) + 1
+        g["last_played"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self._persist()
+        self.grid.viewport().update()
+        self._update_play_button(g)
+        self.tray.setToolTip(f"{APP_NAME} — Playing {g['title']}")
+        self.statusBar().showMessage(f"Launched: {g['title']}", 4000)
+
+    def _stop_game(self, g: dict):
+        entry = self.running.get(g["id"])
+        if not entry:
+            return
+        proc, _ = entry
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    def _poll_processes(self):
+        finished = []
+        for gid, (proc, start) in list(self.running.items()):
+            if proc.poll() is not None:
+                finished.append((gid, time.monotonic() - start))
+        for gid, elapsed in finished:
+            self.running.pop(gid, None)
+            self.delegate.now_playing.discard(gid)
+            g = self._game(gid)
+            if g:
+                g["playtime_seconds"] = int(g.get("playtime_seconds", 0) + elapsed)
+                self._persist()
+                if gid == self.selected_id:
+                    self._render_details(g)
+                self.toast(f"Played {g['title']} for {fmt_playtime(elapsed)}")
+        if finished:
+            self.grid.viewport().update()
+            self.tray.setToolTip(APP_NAME)
+
+    # ---------------- fetch / updates ----------------
+    def _queue_fetches(self, game_ids: list[str]):
+        """Fetch art + info for several games, one at a time."""
+        self._fetch_queue = [gid for gid in game_ids if self._game(gid)]
+        self._fetch_total = len(self._fetch_queue)
+        if self._fetch_queue:
+            self._fetch_next()
+
+    def _fetch_next(self):
+        if not getattr(self, "_fetch_queue", None):
+            _PIX_CACHE.clear()
+            self.model.refresh_all()
+            if self.selected_id:
+                self._select_id(self.selected_id)
+            self.statusBar().clearMessage()
+            self.toast("Finished fetching art & info.")
+            return
+        gid = self._fetch_queue.pop(0)
+        g = self._game(gid)
+        if not g:
+            self._fetch_next()
+            return
+        done = self._fetch_total - len(self._fetch_queue)
+        query = g.get("search_name") or g.get("title")
+        sgdb = self.settings.get("sgdb_api_key", "").strip()
+        self.statusBar().showMessage(
+            f"Fetching info ({done}/{self._fetch_total}): {g.get('title')}…")
+        thread = QThread()
+        worker = FetchWorker(query, gid, sgdb_key=sgdb)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def apply(data, gid=gid):
+            gg = self._game(gid)
+            if gg:
+                if not gg.get("description"):
+                    gg["description"] = data.get("description", "")
+                if data.get("art_path"):
+                    gg["art_path"] = data["art_path"]
+                self._persist()
+
+        worker.finished.connect(apply)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._fetch_next)   # chain to next game
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def fetch_selected(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        query = g.get("search_name") or g.get("title")
+        sgdb = self.settings.get("sgdb_api_key", "").strip()
+        self.statusBar().showMessage(
+            f"Fetching {'Wikipedia + SteamGridDB' if sgdb else 'Wikipedia'} info for '{query}'…")
+        thread = QThread()
+        worker = FetchWorker(query, g["id"], sgdb_key=sgdb)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_fetched)
+        worker.failed.connect(self._on_fetch_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(lambda: self._threads.remove((thread, worker))
+                                if (thread, worker) in self._threads else None)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def _on_fetched(self, data: dict):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        if not g.get("description"):
+            g["description"] = data.get("description", "")
+        if data.get("art_path"):
+            g["art_path"] = data["art_path"]
+        _PIX_CACHE.clear()
+        self._persist()
+        self.model.refresh_all()
+        self._select_id(g["id"])
+        self.toast(f"Fetched info from {data.get('source') or 'online'} ✓")
+
+    def _on_fetch_failed(self, msg: str):
+        self.statusBar().showMessage("Fetch failed", 4000)
+        QMessageBox.warning(self, "Fetch failed", msg)
+
+    def download_latest(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        repo = g.get("github_repo", "").strip()
+        if not repo:
+            self.toast("Set a GitHub repo first (Edit → GitHub repo).")
+            return
+        dest = QFileDialog.getExistingDirectory(
+            self, f"Download '{g['title']}' to which folder?")
+        if not dest:
+            return
+        gid = g["id"]
+        self.download_btn.setEnabled(False)
+        self.statusBar().showMessage(f"Downloading latest {g['title']}…")
+        thread = QThread()
+        worker = DownloadWorker(repo, dest)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def on_progress(pct):
+            if pct >= 0:
+                self.statusBar().showMessage(f"Downloading {g['title']}… {pct}%")
+
+        def on_finished(path, tag, gid=gid):
+            gg = self._game(gid)
+            if gg:
+                if tag:
+                    gg["installed_version"] = tag
+                    gg["latest_version"] = tag
+                self._persist()
+                self.model.refresh_all()
+                if gid == self.selected_id:
+                    self._render_details(gg)
+            self.statusBar().clearMessage()
+            self.toast(f"Downloaded {tag or 'latest'} → {Path(path).name}")
+            try:
+                os.startfile(str(Path(path).parent))    # reveal in Explorer
+            except Exception:
+                pass
+            self.download_btn.setEnabled(True)
+
+        def on_no_asset(url, tag):
+            self.statusBar().clearMessage()
+            webbrowser.open(url)
+            self.toast("No Windows build in the release — opened the downloads page.")
+            self.download_btn.setEnabled(True)
+
+        def on_failed(msg):
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "Download failed", msg)
+            self.download_btn.setEnabled(True)
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.no_asset.connect(on_no_asset)
+        worker.failed.connect(on_failed)
+        for sig in (worker.finished, worker.no_asset, worker.failed):
+            sig.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def check_updates_quiet(self):
+        """Background update check on launch — no modal, toast only if updates exist."""
+        jobs = [(g["id"], g["github_repo"]) for g in self.games if g.get("github_repo")]
+        if not jobs:
+            return
+        thread = QThread()
+        worker = UpdateWorker(jobs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.one.connect(self._on_update_one)
+        worker.done.connect(self._on_updates_quiet_done)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def _on_updates_quiet_done(self, n: int):
+        self._persist()
+        self.model.refresh_all()
+        if self.selected_id:
+            g = self._game(self.selected_id)
+            if g:
+                self._render_update_label(g)
+        updates = [g for g in self.games
+                   if g.get("latest_version") and g.get("installed_version")
+                   and g["latest_version"] != g["installed_version"]]
+        if updates:
+            names = ", ".join(g["title"] for g in updates[:3])
+            extra = f" +{len(updates) - 3} more" if len(updates) > 3 else ""
+            self.toast(f"Updates available: {names}{extra}")
+
+    def check_updates_all(self):
+        jobs = [(g["id"], g["github_repo"]) for g in self.games if g.get("github_repo")]
+        if not jobs:
+            self.toast("No games have a GitHub repo set (Edit → GitHub repo).")
+            return
+        self.statusBar().showMessage(f"Checking {len(jobs)} repo(s) for updates…")
+        thread = QThread()
+        worker = UpdateWorker(jobs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.one.connect(self._on_update_one)
+        worker.done.connect(self._on_updates_done)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def _on_update_one(self, gid: str, tag: str):
+        g = self._game(gid)
+        if g:
+            g["latest_version"] = tag
+
+    def _on_updates_done(self, n: int):
+        self._persist()
+        if self.selected_id:
+            g = self._game(self.selected_id)
+            if g:
+                self._render_update_label(g)
+        updates = [g for g in self.games
+                   if g.get("latest_version") and g.get("installed_version")
+                   and g["latest_version"] != g["installed_version"]]
+        if updates:
+            names = ", ".join(g["title"] for g in updates[:3])
+            self.toast(f"Updates available: {names}")
+        else:
+            self.toast(f"Checked {n} repo(s) — all current / versions unknown.")
+
+    # ---------------- settings ----------------
+    def open_settings(self):
+        dlg = SettingsDialog(self, self.settings)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.settings = dlg.result_settings()
+            save_settings(self.settings)
+            self.apply_theme()
+
+    # ---------------- misc ----------------
+    def toast(self, text: str):
+        t = Toast(self, text, self.theme["accent"])
+        t.show_at(self.rect())
+
+    def _persist(self):
+        save_library(self.games)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+
+    def _restore(self):
+        self.showNormal(); self.raise_(); self.activateWindow()
+
+    def _quit(self):
+        self._really_quit = True
+        QApplication.instance().quit()
+
+    def closeEvent(self, e):
+        if self.settings.get("minimize_to_tray") and not getattr(self, "_really_quit", False):
+            e.ignore()
+            self.hide()
+            self.tray.showMessage(APP_NAME, "Still running in the tray.",
+                                  QSystemTrayIcon.MessageIcon.Information, 2000)
+        else:
+            self.tray.hide()
+            e.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setWindowIcon(app_icon())
+    QApplication.setQuitOnLastWindowClosed(False)
+    w = LauncherWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
