@@ -74,6 +74,7 @@ Auto-identified out of the box (the list lives in `KNOWN_RECOMPS` in [`recomplau
 | Mystical Ninja Starring Goemon | Goemon64Recomp | N64 |
 | Doom 64 | Doom64EX-Plus | N64 |
 | Super Mario 64 | sm64ex / sm64plus / sm64coopdx | N64 |
+| A Link to the Past | zelda3 | SNES |
 | Twilight Princess | Dusk | GameCube |
 | Sonic Unleashed | UnleashedRecomp | Xbox 360 |
 | Sonic 1 & 2 (2013) | RSDKv4 Decompilation | Sega |

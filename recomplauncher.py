@@ -137,6 +137,14 @@ KNOWN_RECOMPS: list[dict] = [
         "search": "The Legend of Zelda: Twilight Princess",
         "github_repo": "JapanDoudou/dusk-zelda", "tags": ["Zelda", "GameCube", "Decomp"],
     },
+    {
+        # zelda3: reverse-engineered reimplementation of A Link to the Past (SNES).
+        "names": ["zelda3.exe"], "patterns": ["zelda3"],
+        "title": "The Legend of Zelda: A Link to the Past",
+        "platform": "zelda3 (decomp reimplementation)",
+        "search": "The Legend of Zelda: A Link to the Past",
+        "github_repo": "snesrev/zelda3", "tags": ["Zelda", "SNES", "Decomp"],
+    },
     # ----- Non-Nintendo recomps / decomp PC ports -----
     {
         "names": ["unleashedrecomp.exe"], "patterns": ["unleashedrecomp"],
