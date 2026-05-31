@@ -11,6 +11,9 @@ all in one place. Built for the recomp scene.
 ![PyQt6](https://img.shields.io/badge/GUI-PyQt6-41cd52)
 ![License](https://img.shields.io/badge/license-GPLv3-orange)
 
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/QppkNN4rb3)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-Support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/zikuju)
+
 <br>
 
 ![ReComp Launcher screenshot](docs/Screenshot.png)
@@ -103,6 +106,15 @@ The standalone executable lands in `dist/`. (CI does this automatically for ever
 ## 🤝 Contributing
 
 The most valuable contribution is **adding more recomps to the fingerprint database** so the launcher recognizes them automatically. It's a single dictionary entry — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## 💬 Community & support
+
+- **Need help or want to chat?** Join the [Discord](https://discord.gg/QppkNN4rb3).
+- **Like the project?** You can [buy me a coffee](https://buymeacoffee.com/zikuju) ☕ — it's hugely appreciated and helps keep development going.
+
+(Both are also available in-app via the **❤ Support** and **💬 Get Help** toolbar buttons.)
 
 ---
 

@@ -46,6 +46,8 @@ from PyQt6.QtWidgets import (
 # ======================================================================
 
 APP_NAME = "ReComp Launcher"
+SUPPORT_URL = "https://buymeacoffee.com/zikuju"
+DISCORD_URL = "https://discord.gg/QppkNN4rb3"
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ART_DIR = DATA_DIR / "art"
@@ -1512,6 +1514,8 @@ class LauncherWindow(QMainWindow):
         self._act(tb, "⬆  Check Updates", self.check_updates_all)
         tb.addSeparator()
         self._act(tb, "⚙  Settings", self.open_settings)
+        self._act(tb, "❤  Support", self.open_support)
+        self._act(tb, "💬  Get Help", self.open_help)
 
         # search box on the toolbar (right-aligned)
         spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -2254,6 +2258,12 @@ class LauncherWindow(QMainWindow):
             self.settings = dlg.result_settings()
             save_settings(self.settings)
             self.apply_theme()
+
+    def open_support(self):
+        webbrowser.open(SUPPORT_URL)
+
+    def open_help(self):
+        webbrowser.open(DISCORD_URL)
 
     # ---------------- misc ----------------
     def toast(self, text: str):
