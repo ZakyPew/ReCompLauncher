@@ -11,6 +11,10 @@ all in one place. Built for the recomp scene.
 ![PyQt6](https://img.shields.io/badge/GUI-PyQt6-41cd52)
 ![License](https://img.shields.io/badge/license-GPLv3-orange)
 
+<br>
+
+![ReComp Launcher screenshot](docs/Screenshot.png)
+
 </div>
 
 ---
