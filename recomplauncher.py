@@ -720,6 +720,138 @@ class DownloadWorker(QObject):
 
 
 # ======================================================================
+# XInput controller support (Windows, zero extra dependencies)
+# ======================================================================
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class _XINPUT_GAMEPAD(ctypes.Structure):
+        _fields_ = [("wButtons", wintypes.WORD),
+                    ("bLeftTrigger", ctypes.c_ubyte),
+                    ("bRightTrigger", ctypes.c_ubyte),
+                    ("sThumbLX", ctypes.c_short),
+                    ("sThumbLY", ctypes.c_short),
+                    ("sThumbRX", ctypes.c_short),
+                    ("sThumbRY", ctypes.c_short)]
+
+    class _XINPUT_STATE(ctypes.Structure):
+        _fields_ = [("dwPacketNumber", wintypes.DWORD),
+                    ("Gamepad", _XINPUT_GAMEPAD)]
+
+    def _load_xinput():
+        for name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+            try:
+                return ctypes.WinDLL(name)
+            except OSError:
+                continue
+        return None
+else:  # non-Windows: poller simply reports unavailable
+    def _load_xinput():
+        return None
+
+# XInput wButtons bit flags -> logical names
+_XI_BUTTONS = {
+    0x0001: "up", 0x0002: "down", 0x0004: "left", 0x0008: "right",
+    0x0010: "start", 0x0020: "back",
+    0x0100: "lb", 0x0200: "rb",
+    0x1000: "a", 0x2000: "b", 0x4000: "x", 0x8000: "y",
+}
+
+
+class ControllerPoller(QObject):
+    """Polls Xbox-style (XInput) gamepads on a lightweight timer.
+
+    Emits `pressed` with one of: up/down/left/right/a/b/x/y/start/back/lb/rb.
+    D-pad and left stick are merged into one direction that auto-repeats
+    while held (350 ms delay, then every 130 ms) so browsing feels natural.
+    """
+    pressed = pyqtSignal(str)
+    connected = pyqtSignal()
+    disconnected = pyqtSignal()
+
+    DEADZONE = 16000
+    REPEAT_DELAY = 0.35
+    REPEAT_RATE = 0.13
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.xi = _load_xinput()
+        self.available = self.xi is not None
+        self.pad: int | None = None
+        self._prev_buttons = 0
+        self._dir: str | None = None
+        self._dir_since = 0.0
+        self._dir_last = 0.0
+        if self.available:
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._poll)
+            self._timer.start(33)
+
+    def _read(self):
+        """Return (buttons, lx, ly) from the first connected pad, else None."""
+        state = _XINPUT_STATE()
+        pads = [self.pad] if self.pad is not None else range(4)
+        for i in pads:
+            if self.xi.XInputGetState(i, ctypes.byref(state)) == 0:
+                if self.pad != i:
+                    self.pad = i
+                    self.connected.emit()
+                gp = state.Gamepad
+                return gp.wButtons, gp.sThumbLX, gp.sThumbLY
+        if self.pad is not None:
+            self.pad = None
+            self.disconnected.emit()
+        return None
+
+    def _step(self, buttons: int, lx: int, ly: int, now: float) -> list[str]:
+        """Pure input-translation step (separated out for testability)."""
+        out = []
+        newly = buttons & ~self._prev_buttons
+        self._prev_buttons = buttons
+        for bit, name in _XI_BUTTONS.items():
+            if newly & bit and name not in ("up", "down", "left", "right"):
+                out.append(name)
+        # merge d-pad + left stick into one auto-repeating direction
+        d = None
+        if buttons & 0x0001:
+            d = "up"
+        elif buttons & 0x0002:
+            d = "down"
+        elif buttons & 0x0004:
+            d = "left"
+        elif buttons & 0x0008:
+            d = "right"
+        elif abs(lx) > self.DEADZONE or abs(ly) > self.DEADZONE:
+            if abs(lx) >= abs(ly):
+                d = "right" if lx > 0 else "left"
+            else:
+                d = "up" if ly > 0 else "down"
+        if d != self._dir:
+            self._dir = d
+            self._dir_since = now
+            self._dir_last = now
+            if d:
+                out.append(d)
+        elif d and (now - self._dir_since >= self.REPEAT_DELAY
+                    and now - self._dir_last >= self.REPEAT_RATE):
+            self._dir_last = now
+            out.append(d)
+        return out
+
+    def _poll(self):
+        r = self._read()
+        if r is None:
+            self._prev_buttons = 0
+            self._dir = None
+            return
+        buttons, lx, ly = r
+        for name in self._step(buttons, lx, ly, time.monotonic()):
+            self.pressed.emit(name)
+
+
+# ======================================================================
 # Grid model + delegate
 # ======================================================================
 
@@ -1458,6 +1590,208 @@ class IdentifyDialog(QDialog):
 
 
 # ======================================================================
+# Big Picture mode
+# ======================================================================
+
+class BigPictureWindow(QWidget):
+    """Fullscreen, controller-first library view (Steam Big Picture style).
+
+    A/Enter launches, B/Esc exits, left-right (d-pad, stick, LB/RB or arrow
+    keys) browses, Y/Space toggles favorite. Painted directly for a clean
+    10-foot look: giant center cover, dimmed neighbours, hint bar.
+    """
+
+    def __init__(self, main: "LauncherWindow", games: list[dict], start_index: int = 0):
+        super().__init__()
+        self.main = main
+        self.games = games
+        self.idx = max(0, min(start_index, len(games) - 1)) if games else 0
+        self.flash_text = ""
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._clear_flash)
+        self.setWindowTitle(f"{APP_NAME} — Big Picture")
+        self.setCursor(Qt.CursorShape.BlankCursor)
+
+    # ----- input -----
+    def handle(self, btn: str):
+        if btn in ("left", "lb"):
+            self.move_sel(-1)
+        elif btn in ("right", "rb"):
+            self.move_sel(1)
+        elif btn == "a":
+            self.launch()
+        elif btn in ("b", "back"):
+            self.close()
+        elif btn == "y":
+            self.toggle_fav()
+
+    def keyPressEvent(self, e):
+        k = e.key()
+        if k == Qt.Key.Key_Left:
+            self.move_sel(-1)
+        elif k == Qt.Key.Key_Right:
+            self.move_sel(1)
+        elif k in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.launch()
+        elif k in (Qt.Key.Key_Escape, Qt.Key.Key_F11):
+            self.close()
+        elif k == Qt.Key.Key_Space:
+            self.toggle_fav()
+        else:
+            super().keyPressEvent(e)
+
+    # ----- actions -----
+    def game(self) -> dict | None:
+        return self.games[self.idx] if self.games else None
+
+    def move_sel(self, delta: int):
+        if self.games:
+            self.idx = (self.idx + delta) % len(self.games)
+            self.update()
+
+    def launch(self):
+        g = self.game()
+        if not g:
+            return
+        if g["id"] in self.main.running:
+            self.flash("Already running")
+            return
+        exe = g.get("exe_path", "")
+        if not exe or not Path(exe).exists():
+            self.flash("No executable set — press B and use Edit")
+            return
+        self.main._select_id(g["id"])
+        self.main.play_selected()
+        self.flash(f"Launching {g['title']}…")
+
+    def toggle_fav(self):
+        g = self.game()
+        if not g:
+            return
+        g["favorite"] = not g.get("favorite")
+        self.main._persist()
+        self.flash("★ Added to favorites" if g["favorite"] else "☆ Removed from favorites")
+
+    def flash(self, text: str):
+        self.flash_text = text
+        self._flash_timer.start(2200)
+        self.update()
+
+    def _clear_flash(self):
+        self.flash_text = ""
+        self.update()
+
+    def closeEvent(self, e):
+        self.main.bp_window = None
+        e.accept()
+
+    # ----- painting -----
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        t = self.main.theme
+
+        grad = QLinearGradient(0, 0, 0, r.height())
+        grad.setColorAt(0.0, QColor("#0d0d18"))
+        grad.setColorAt(1.0, QColor("#05050a"))
+        p.fillRect(r, QBrush(grad))
+
+        # brand top-left, counter top-right
+        p.setPen(QColor(150, 150, 170))
+        f = QFont("Segoe UI", max(10, int(r.height() * 0.016)))
+        p.setFont(f)
+        p.drawText(r.adjusted(30, 20, -30, 0),
+                   int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft), APP_NAME)
+        if self.games:
+            p.drawText(r.adjusted(30, 20, -30, 0),
+                       int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight),
+                       f"{self.idx + 1} / {len(self.games)}")
+
+        if not self.games:
+            p.setPen(QColor(150, 150, 170))
+            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), "Library is empty")
+            p.end()
+            return
+
+        g = self.games[self.idx]
+        cx, cy = r.width() // 2, int(r.height() * 0.44)
+        ch = int(r.height() * 0.52)
+        cw = int(ch * 0.72)
+        sh = int(ch * 0.68)
+        sw = int(sh * 0.72)
+        gap = int(cw * 0.78)
+
+        # dimmed neighbours (only when there's something different to show)
+        if len(self.games) > 1:
+            for offset in (-1, 1):
+                if len(self.games) == 2 and offset == -1:
+                    continue
+                ng = self.games[(self.idx + offset) % len(self.games)]
+                pm = art_for(ng, sw, sh)
+                p.setOpacity(0.30)
+                p.drawPixmap(cx + offset * (gap + sw // 2) - sw // 2, cy - sh // 2, pm)
+            p.setOpacity(1.0)
+
+        # center cover with shadow plate + accent frame
+        pm = art_for(g, cw, ch)
+        x, y = cx - cw // 2, cy - ch // 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 130))
+        p.drawRoundedRect(QRectF(x - 10, y - 10, cw + 20, ch + 20), 14, 14)
+        p.drawPixmap(x, y, pm)
+        p.setPen(QPen(QColor(t["accent"]), 3))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(x - 6, y - 6, cw + 12, ch + 12), 10, 10)
+
+        # title (+ favorite star / now-playing)
+        title = g.get("title", "?")
+        if g.get("favorite"):
+            title = "★ " + title
+        p.setPen(QColor("#f2f2f7"))
+        tf = QFont("Segoe UI", max(16, int(r.height() * 0.030)))
+        tf.setBold(True)
+        p.setFont(tf)
+        title_rect = QRect(r.left() + 60, y + ch + 24, r.width() - 120,
+                           int(r.height() * 0.06))
+        p.drawText(title_rect, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop), title)
+
+        # meta line
+        bits = [b for b in (g.get("platform", ""),) if b]
+        if g.get("playtime_seconds", 0) >= 60:
+            bits.append(f"⏱ {fmt_playtime(g['playtime_seconds'])}")
+        if g["id"] in self.main.running:
+            bits.append("● PLAYING")
+        p.setPen(QColor(t["accent"]))
+        mf = QFont("Segoe UI", max(11, int(r.height() * 0.017)))
+        p.setFont(mf)
+        meta_rect = QRect(title_rect.left(), title_rect.bottom(), title_rect.width(),
+                          int(r.height() * 0.05))
+        p.drawText(meta_rect, int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                   "   •   ".join(bits))
+
+        # transient flash message
+        if self.flash_text:
+            p.setPen(QColor("#ffffff"))
+            ff = QFont("Segoe UI", max(12, int(r.height() * 0.020)))
+            ff.setBold(True)
+            p.setFont(ff)
+            p.drawText(r.adjusted(0, 0, 0, -int(r.height() * 0.14)),
+                       int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom),
+                       self.flash_text)
+
+        # hint bar
+        p.setPen(QColor(140, 140, 160))
+        hf = QFont("Segoe UI", max(10, int(r.height() * 0.016)))
+        p.setFont(hf)
+        p.drawText(r.adjusted(0, 0, 0, -30),
+                   int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom),
+                   "Ⓐ Play        Ⓑ Exit        ⬅ ➡ Browse        Ⓨ Favorite")
+        p.end()
+
+
+# ======================================================================
 # Main window
 # ======================================================================
 
@@ -1492,6 +1826,19 @@ class LauncherWindow(QMainWindow):
         self._proc_timer.timeout.connect(self._poll_processes)
         self._proc_timer.start(1000)
 
+        # big picture + controller
+        self.bp_window = None
+        self.controller = None
+        try:
+            poller = ControllerPoller(self)
+            if poller.available:
+                self.controller = poller
+                poller.pressed.connect(self._on_controller)
+                poller.connected.connect(lambda: self.toast("🎮 Controller connected"))
+                poller.disconnected.connect(lambda: self.toast("🎮 Controller disconnected"))
+        except Exception:
+            pass
+
         self.rebuild_sidebar()
         if self.model.rowCount() > 0:
             self.grid.setCurrentIndex(self.model.index(0, 0))
@@ -1512,6 +1859,7 @@ class LauncherWindow(QMainWindow):
         self._act(tb, "🗑  Remove", self.remove_selected)
         tb.addSeparator()
         self._act(tb, "⬆  Check Updates", self.check_updates_all)
+        self._act(tb, "🖥  Big Picture", self.toggle_big_picture)
         tb.addSeparator()
         self._act(tb, "⚙  Settings", self.open_settings)
         self._act(tb, "❤  Support", self.open_support)
@@ -1652,6 +2000,7 @@ class LauncherWindow(QMainWindow):
         QShortcut(QKeySequence("Space"), self, activated=self.toggle_favorite)
         QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.zoom_slider.setValue(self.zoom_slider.value() + 10))
         QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.zoom_slider.setValue(self.zoom_slider.value() - 10))
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_big_picture)
 
     # ---------------- theme ----------------
     def apply_theme(self):
@@ -2258,6 +2607,55 @@ class LauncherWindow(QMainWindow):
             self.settings = dlg.result_settings()
             save_settings(self.settings)
             self.apply_theme()
+
+    # ---------------- big picture / controller ----------------
+    def toggle_big_picture(self):
+        if self.bp_window:
+            self.bp_window.close()
+            return
+        games = list(self.model._visible) or list(self.games)
+        if not games:
+            self.toast("Library is empty — add a game first.")
+            return
+        start = 0
+        if self.selected_id:
+            for i, g in enumerate(games):
+                if g["id"] == self.selected_id:
+                    start = i
+                    break
+        self.bp_window = BigPictureWindow(self, games, start)
+        self.bp_window.showFullScreen()
+
+    def _on_controller(self, btn: str):
+        bp = self.bp_window
+        if bp and bp.isVisible():
+            if bp.isActiveWindow():
+                bp.handle(btn)
+            return
+        if not self.isActiveWindow():
+            return  # a game (or another app) has focus — don't steal input
+        if btn in ("left", "right", "up", "down"):
+            self._controller_move(btn)
+        elif btn == "a":
+            self.play_selected()
+        elif btn == "y":
+            self.toggle_favorite()
+        elif btn == "start":
+            self.toggle_big_picture()
+
+    def _controller_move(self, direction: str):
+        count = self.model.rowCount()
+        if not count:
+            return
+        cur = self.grid.currentIndex().row()
+        if cur < 0:
+            cur = 0
+        w, _ = self.delegate.card_size()
+        cell = w + 16 + self.grid.spacing()
+        cols = max(1, self.grid.viewport().width() // cell)
+        delta = {"left": -1, "right": 1, "up": -cols, "down": cols}[direction]
+        new = max(0, min(count - 1, cur + delta))
+        self.grid.setCurrentIndex(self.model.index(new, 0))
 
     def open_support(self):
         webbrowser.open(SUPPORT_URL)
