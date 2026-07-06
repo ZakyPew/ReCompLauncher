@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -760,12 +761,186 @@ _XI_BUTTONS = {
 }
 
 
+# ----- PlayStation controllers (DualSense / DualShock 4) -----------------
+# Windows exposes Sony pads as raw HID devices, not XInput, so we read their
+# input reports directly and translate them into the same XInput-style button
+# mask ControllerPoller understands. Face buttons map by position:
+# Cross->A, Circle->B, Square->X, Triangle->Y; Options->start, Create->back.
+
+_SONY_PIDS = (0x0CE6, 0x0DF2, 0x05C4, 0x09CC, 0x0BA0)  # DualSense, Edge, DS4 v1/v2, dongle
+
+# d-pad hat nibble (0=N .. 7=NW, 8+=released) -> direction bits
+_HAT_TO_MASK = [0x0001, 0x0009, 0x0008, 0x000A, 0x0002, 0x0006, 0x0004, 0x0005,
+                0, 0, 0, 0, 0, 0, 0, 0]
+
+
+def _parse_sony_report(d: bytes, dualsense: bool):
+    """Translate a Sony HID input report to (buttons_mask, lx, ly), or None.
+
+    Layouts: DualSense USB report 0x01 (buttons at 8/9), DualSense Bluetooth
+    enhanced 0x31 (offset +1), DS4 BT enhanced 0x11 (offset +2), and the
+    shared DS4-USB / BT-compatibility report 0x01 (buttons at 5/6).
+    """
+    n = len(d)
+    if n < 10:
+        return None
+    rid = d[0]
+    if dualsense and rid == 0x01 and n >= 30:        # DualSense over USB
+        lx, ly, b0, b1 = d[1], d[2], d[8], d[9]
+    elif dualsense and rid == 0x31 and n >= 12:      # DualSense over Bluetooth
+        lx, ly, b0, b1 = d[2], d[3], d[9], d[10]
+    elif not dualsense and rid == 0x11 and n >= 10:  # DS4 over Bluetooth
+        lx, ly, b0, b1 = d[3], d[4], d[7], d[8]
+    elif rid == 0x01:                                # DS4 USB / BT-compat mode
+        lx, ly, b0, b1 = d[1], d[2], d[5], d[6]
+    else:
+        return None
+    buttons = _HAT_TO_MASK[b0 & 0x0F]
+    if b0 & 0x10:
+        buttons |= 0x4000   # Square   -> X
+    if b0 & 0x20:
+        buttons |= 0x1000   # Cross    -> A
+    if b0 & 0x40:
+        buttons |= 0x2000   # Circle   -> B
+    if b0 & 0x80:
+        buttons |= 0x8000   # Triangle -> Y
+    if b1 & 0x01:
+        buttons |= 0x0100   # L1 -> LB
+    if b1 & 0x02:
+        buttons |= 0x0200   # R1 -> RB
+    if b1 & 0x10:
+        buttons |= 0x0020   # Create/Share -> back
+    if b1 & 0x20:
+        buttons |= 0x0010   # Options -> start
+    # HID sticks are 0..255 with Y-down; rescale to XInput's signed Y-up range
+    return buttons, (lx - 128) * 257, (128 - ly) * 257
+
+
+if sys.platform == "win32":
+    SETUPAPI = ctypes.WinDLL("setupapi")
+    HIDDLL = ctypes.WinDLL("hid")
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    class _SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("InterfaceClassGuid", _GUID),
+                    ("Flags", wintypes.DWORD), ("Reserved", ctypes.c_void_p)]
+
+    SETUPAPI.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    SETUPAPI.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                              ctypes.c_void_p, wintypes.DWORD]
+    SETUPAPI.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+    SETUPAPI.SetupDiEnumDeviceInterfaces.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                     ctypes.c_void_p, wintypes.DWORD,
+                                                     ctypes.c_void_p]
+    SETUPAPI.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+    SETUPAPI.SetupDiGetDeviceInterfaceDetailW.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                          ctypes.c_void_p, wintypes.DWORD,
+                                                          ctypes.c_void_p, ctypes.c_void_p]
+    SETUPAPI.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+    KERNEL32.CreateFileW.restype = ctypes.c_void_p
+    KERNEL32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                     ctypes.c_void_p]
+    KERNEL32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                  ctypes.c_void_p, ctypes.c_void_p]
+    KERNEL32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+    class _SonyHidReader(threading.Thread):
+        """Blocking-read loop for PlayStation pads; keeps `state` up to date.
+
+        `state` is the latest (buttons_mask, lx, ly) or None while nothing is
+        connected. Runs as a daemon thread; reconnects automatically every
+        couple of seconds when a pad appears/disappears.
+        """
+
+        def __init__(self):
+            super().__init__(daemon=True)
+            self.state = None
+            self._stop = False
+
+        def stop(self):
+            self._stop = True
+
+        @staticmethod
+        def _find() -> str | None:
+            try:
+                guid = _GUID()
+                HIDDLL.HidD_GetHidGuid(ctypes.byref(guid))
+                h = SETUPAPI.SetupDiGetClassDevsW(ctypes.byref(guid), None, None,
+                                                  0x12)  # PRESENT | DEVICEINTERFACE
+                if not h or h == _INVALID_HANDLE:
+                    return None
+                try:
+                    ifd = _SP_DEVICE_INTERFACE_DATA()
+                    ifd.cbSize = ctypes.sizeof(ifd)
+                    i = 0
+                    while SETUPAPI.SetupDiEnumDeviceInterfaces(
+                            h, None, ctypes.byref(guid), i, ctypes.byref(ifd)):
+                        i += 1
+                        need = wintypes.DWORD(0)
+                        SETUPAPI.SetupDiGetDeviceInterfaceDetailW(
+                            h, ctypes.byref(ifd), None, 0, ctypes.byref(need), None)
+                        buf = ctypes.create_string_buffer(need.value + 8)
+                        ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = (
+                            8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6)
+                        if SETUPAPI.SetupDiGetDeviceInterfaceDetailW(
+                                h, ctypes.byref(ifd), buf, need.value + 8, None, None):
+                            path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+                            lp = path.lower()
+                            if "vid_054c" in lp and any(
+                                    f"pid_{p:04x}" in lp for p in _SONY_PIDS):
+                                return path
+                finally:
+                    SETUPAPI.SetupDiDestroyDeviceInfoList(h)
+            except Exception:
+                pass
+            return None
+
+        def run(self):
+            while not self._stop:
+                path = self._find()
+                if not path:
+                    self.state = None
+                    time.sleep(2.0)
+                    continue
+                m = re.search(r"pid_([0-9a-f]{4})", path.lower())
+                dualsense = bool(m) and int(m.group(1), 16) in (0x0CE6, 0x0DF2)
+                handle = KERNEL32.CreateFileW(path, 0xC0000000, 3, None, 3, 0, None)
+                if not handle or handle == _INVALID_HANDLE:
+                    handle = KERNEL32.CreateFileW(path, 0x80000000, 3, None, 3, 0, None)
+                if not handle or handle == _INVALID_HANDLE:
+                    self.state = None
+                    time.sleep(2.0)
+                    continue
+                buf = ctypes.create_string_buffer(1024)
+                got = wintypes.DWORD(0)
+                while not self._stop:
+                    if (not KERNEL32.ReadFile(handle, buf, 1024, ctypes.byref(got), None)
+                            or got.value == 0):
+                        break
+                    parsed = _parse_sony_report(buf.raw[:got.value], dualsense)
+                    if parsed:
+                        self.state = parsed
+                KERNEL32.CloseHandle(handle)
+                self.state = None
+else:
+    _SonyHidReader = None
+
+
 class ControllerPoller(QObject):
-    """Polls Xbox-style (XInput) gamepads on a lightweight timer.
+    """Polls XInput (Xbox) and PlayStation (DualSense / DualShock 4) gamepads.
 
     Emits `pressed` with one of: up/down/left/right/a/b/x/y/start/back/lb/rb.
     D-pad and left stick are merged into one direction that auto-repeats
     while held (350 ms delay, then every 130 ms) so browsing feels natural.
+    XInput pads take priority, so mappers like DS4Windows/Steam Input that
+    present a Sony pad as XInput never cause double input.
     """
     pressed = pyqtSignal(str)
     connected = pyqtSignal()
@@ -778,8 +953,16 @@ class ControllerPoller(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.xi = _load_xinput()
-        self.available = self.xi is not None
+        self.sony = None
+        if _SonyHidReader is not None:
+            try:
+                self.sony = _SonyHidReader()
+                self.sony.start()
+            except Exception:
+                self.sony = None
+        self.available = self.xi is not None or self.sony is not None
         self.pad: int | None = None
+        self._src: str | None = None      # 'xinput' | 'sony' | None
         self._prev_buttons = 0
         self._dir: str | None = None
         self._dir_since = 0.0
@@ -790,20 +973,31 @@ class ControllerPoller(QObject):
             self._timer.start(33)
 
     def _read(self):
-        """Return (buttons, lx, ly) from the first connected pad, else None."""
-        state = _XINPUT_STATE()
-        pads = [self.pad] if self.pad is not None else range(4)
-        for i in pads:
-            if self.xi.XInputGetState(i, ctypes.byref(state)) == 0:
-                if self.pad != i:
+        """Return (buttons, lx, ly) from whichever pad is talking, else None."""
+        if self.xi:
+            state = _XINPUT_STATE()
+            pads = [self.pad] if self.pad is not None else range(4)
+            for i in pads:
+                if self.xi.XInputGetState(i, ctypes.byref(state)) == 0:
                     self.pad = i
-                    self.connected.emit()
-                gp = state.Gamepad
-                return gp.wButtons, gp.sThumbLX, gp.sThumbLY
-        if self.pad is not None:
+                    self._set_src("xinput")
+                    gp = state.Gamepad
+                    return gp.wButtons, gp.sThumbLX, gp.sThumbLY
             self.pad = None
-            self.disconnected.emit()
+        s = self.sony.state if self.sony else None
+        if s is not None:
+            self._set_src("sony")
+            return s
+        self._set_src(None)
         return None
+
+    def _set_src(self, src: str | None):
+        if src != self._src:
+            old, self._src = self._src, src
+            if src is not None and old is None:
+                self.connected.emit()
+            elif src is None and old is not None:
+                self.disconnected.emit()
 
     def _step(self, buttons: int, lx: int, ly: int, now: float) -> list[str]:
         """Pure input-translation step (separated out for testability)."""

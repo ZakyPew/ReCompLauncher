@@ -31,7 +31,7 @@ all in one place. Built for the recomp scene.
 - **⬆ Update checking** — checks each game's GitHub releases on launch and badges any card with an available update.
 - **⏱ Playtime tracking** — playtime, last-played, and launch counts, tracked automatically.
 - **🚀 Launch profiles** — per-game command-line profiles for mods, configs, and save slots.
-- **🎮 Controller support** — Xbox-style (XInput) gamepads work out of the box, no setup: browse the grid, launch games, and drive Big Picture from the couch.
+- **🎮 Controller support** — Xbox (XInput) **and** PlayStation (DualSense / DualShock 4, USB or Bluetooth) pads work out of the box, no setup: browse the grid, launch games, and drive Big Picture from the couch.
 - **🖥 Big Picture mode** — a fullscreen, controller-first view (`F11` or the Start button) with giant cover art, Steam-style. **A** to play, **B** to exit, **Y** to favorite.
 - **🎨 Themes** — Dracula, Nord, Midnight, and Light.
 - **⌨ Polish** — keyboard shortcuts, system-tray support, per-game screenshot galleries.
