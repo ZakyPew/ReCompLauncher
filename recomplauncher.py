@@ -774,24 +774,45 @@ _HAT_TO_MASK = [0x0001, 0x0009, 0x0008, 0x000A, 0x0002, 0x0006, 0x0004, 0x0005,
                 0, 0, 0, 0, 0, 0, 0, 0]
 
 
-def _parse_sony_report(d: bytes, dualsense: bool):
+def _sony_pid_from_path(path: str) -> int | None:
+    """Extract a known Sony product id from a HID device path, else None.
+
+    USB paths look like  hid#vid_054c&pid_0ce6#...  while Bluetooth paths
+    look like  hid#{...}_vid&0002054c_pid&0ce6#...  — match both.
+    """
+    lp = path.lower()
+    if not re.search(r"vid(?:_|&[0-9a-f]{4})054c", lp):
+        return None
+    m = re.search(r"pid[_&]([0-9a-f]{4})", lp)
+    if m:
+        pid = int(m.group(1), 16)
+        if pid in _SONY_PIDS:
+            return pid
+    return None
+
+
+def _parse_sony_report(d: bytes, dualsense: bool, bluetooth: bool = False):
     """Translate a Sony HID input report to (buttons_mask, lx, ly), or None.
 
     Layouts: DualSense USB report 0x01 (buttons at 8/9), DualSense Bluetooth
     enhanced 0x31 (offset +1), DS4 BT enhanced 0x11 (offset +2), and the
-    shared DS4-USB / BT-compatibility report 0x01 (buttons at 5/6).
+    shared DS4-style compatibility report 0x01 (buttons at 5/6).
+
+    Transport matters: over Bluetooth the DualSense's compat report is ALSO
+    id 0x01 but padded to 78 bytes, so report length alone cannot pick the
+    layout — the caller tells us which transport the device is on.
     """
     n = len(d)
     if n < 10:
         return None
     rid = d[0]
-    if dualsense and rid == 0x01 and n >= 30:        # DualSense over USB
+    if dualsense and rid == 0x01 and not bluetooth and n >= 30:  # DualSense USB
         lx, ly, b0, b1 = d[1], d[2], d[8], d[9]
-    elif dualsense and rid == 0x31 and n >= 12:      # DualSense over Bluetooth
+    elif dualsense and rid == 0x31 and n >= 12:      # DualSense BT (enhanced)
         lx, ly, b0, b1 = d[2], d[3], d[9], d[10]
-    elif not dualsense and rid == 0x11 and n >= 10:  # DS4 over Bluetooth
+    elif not dualsense and rid == 0x11 and n >= 10:  # DS4 BT (enhanced)
         lx, ly, b0, b1 = d[3], d[4], d[7], d[8]
-    elif rid == 0x01:                                # DS4 USB / BT-compat mode
+    elif rid == 0x01:            # DS4 USB / any BT-compat report (DS4 layout)
         lx, ly, b0, b1 = d[1], d[2], d[5], d[6]
     else:
         return None
@@ -862,6 +883,7 @@ if sys.platform == "win32":
         def __init__(self):
             super().__init__(daemon=True)
             self.state = None
+            self.opened_path: str | None = None   # diagnostic: device in use
             self._stop = False
 
         def stop(self):
@@ -892,9 +914,7 @@ if sys.platform == "win32":
                         if SETUPAPI.SetupDiGetDeviceInterfaceDetailW(
                                 h, ctypes.byref(ifd), buf, need.value + 8, None, None):
                             path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
-                            lp = path.lower()
-                            if "vid_054c" in lp and any(
-                                    f"pid_{p:04x}" in lp for p in _SONY_PIDS):
+                            if _sony_pid_from_path(path) is not None:
                                 return path
                 finally:
                     SETUPAPI.SetupDiDestroyDeviceInfoList(h)
@@ -909,8 +929,10 @@ if sys.platform == "win32":
                     self.state = None
                     time.sleep(2.0)
                     continue
-                m = re.search(r"pid_([0-9a-f]{4})", path.lower())
-                dualsense = bool(m) and int(m.group(1), 16) in (0x0CE6, 0x0DF2)
+                pid = _sony_pid_from_path(path)
+                dualsense = pid in (0x0CE6, 0x0DF2)
+                lp = path.lower()
+                bluetooth = "{00001124" in lp or "vid&" in lp
                 handle = KERNEL32.CreateFileW(path, 0xC0000000, 3, None, 3, 0, None)
                 if not handle or handle == _INVALID_HANDLE:
                     handle = KERNEL32.CreateFileW(path, 0x80000000, 3, None, 3, 0, None)
@@ -918,16 +940,18 @@ if sys.platform == "win32":
                     self.state = None
                     time.sleep(2.0)
                     continue
+                self.opened_path = path
                 buf = ctypes.create_string_buffer(1024)
                 got = wintypes.DWORD(0)
                 while not self._stop:
                     if (not KERNEL32.ReadFile(handle, buf, 1024, ctypes.byref(got), None)
                             or got.value == 0):
                         break
-                    parsed = _parse_sony_report(buf.raw[:got.value], dualsense)
+                    parsed = _parse_sony_report(buf.raw[:got.value], dualsense, bluetooth)
                     if parsed:
                         self.state = parsed
                 KERNEL32.CloseHandle(handle)
+                self.opened_path = None
                 self.state = None
 else:
     _SonyHidReader = None
