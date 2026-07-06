@@ -33,7 +33,7 @@ all in one place. Built for the recomp scene.
 - **🏆 RetroAchievements** — link your RA account and every game gets a 🏆 tab showing the official achievement set and your unlocks. Game IDs auto-match by title.
 - **🚀 Launch profiles** — per-game command-line profiles for mods, configs, and save slots.
 - **🎮 Controller support** — Xbox (XInput) **and** PlayStation (DualSense / DualShock 4, USB or Bluetooth) pads work out of the box, no setup: browse the grid, launch games, and drive Big Picture from the couch.
-- **🖥 Big Picture mode** — a fullscreen, controller-first view (`F11` or the Start button) with giant cover art, Steam-style. **A** to play, **B** to exit, **Y** to favorite.
+- **🖥 Big Picture mode** — a fullscreen, controller-first view (`F11` or the Start button) with giant cover art, Steam-style. **A** to play, **B** to exit, **Y** to favorite. Fully skinnable: drop any image named `bigpicture_bg.png` into your `data/` folder and it becomes the backdrop, auto-dimmed for readability.
 - **🎨 Themes** — Dracula, Nord, Midnight, and Light.
 - **⌨ Polish** — keyboard shortcuts, system-tray support, per-game screenshot galleries.
 
@@ -109,6 +109,34 @@ Unlocks shown here are the ones you earn playing through an RA-enabled emulator.
 Notably, **Unleashed Recompiled ships its own built-in achievement system** (a native
 recreation of the Xbox 360 set) — no launcher setup needed there. If a recomp adds
 official RA support later, this launcher is ready to meet it.
+
+---
+
+## 🖼 Custom Big Picture background
+
+Big Picture looks for a backdrop image in this order:
+
+1. `data/bigpicture_bg.png` (also `.jpg` / `.jpeg` / `.webp`) — **your** image, never touched by updates
+2. `assets/bigpicture_bg.png` — the project default
+
+Any resolution works: the image is cover-scaled to your screen and dimmed so covers
+and text stay readable. Delete the file to go back to the plain gradient.
+
+---
+
+## 🐧 Linux
+
+The launcher runs from source on Linux:
+
+```bash
+pip install -r requirements.txt
+python recomplauncher.py
+```
+
+- **⬇ Get Latest Release** automatically picks Linux builds (Linux-X64 archives, AppImage, Flatpak as fallback) instead of Windows ones.
+- **📁 Scan Folder** finds `.AppImage` files as well as `.exe`.
+- An experimental prebuilt Linux binary is produced by CI on releases.
+- **Current limitation:** controller support (XInput / DualSense) is Windows-only for now — keyboard fully drives Big Picture on Linux. Contributions welcome (evdev)!
 
 ---
 

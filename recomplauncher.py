@@ -472,6 +472,30 @@ def art_for(game: dict, w: int, h: int) -> QPixmap:
     return result
 
 
+def asset_path(name: str) -> Path:
+    """Locate a bundled asset, working both from source and frozen builds."""
+    base = Path(getattr(sys, "_MEIPASS", APP_DIR))
+    return base / "assets" / name
+
+
+# Big Picture background: drop an image with this name into data/ to use your
+# own (user override), or ship one in assets/ as the project default.
+_BG_NAMES = ("bigpicture_bg.png", "bigpicture_bg.jpg",
+             "bigpicture_bg.jpeg", "bigpicture_bg.webp")
+
+
+def find_bp_background() -> str | None:
+    for n in _BG_NAMES:
+        p = DATA_DIR / n
+        if p.exists():
+            return str(p)
+    for n in _BG_NAMES:
+        p = asset_path(n)
+        if p.exists():
+            return str(p)
+    return None
+
+
 def app_icon() -> QIcon:
     pm = QPixmap(64, 64)
     pm.fill(Qt.GlobalColor.transparent)
@@ -642,24 +666,39 @@ class UpdateWorker(QObject):
         self.done.emit(checked)
 
 
-def pick_windows_asset(assets: list[dict]) -> dict | None:
-    """From a GitHub release's asset list, pick the best Windows download.
+def pick_release_asset(assets: list[dict], platform: str | None = None) -> dict | None:
+    """From a GitHub release's asset list, pick the best download for this OS.
 
-    Prefers names mentioning windows/win64/win-x64/win32, then x64 over others,
-    then archives (.zip/.7z) or installers (.exe). Returns the asset dict
-    (with 'name' and 'browser_download_url') or None if nothing looks like Windows.
+    Windows prefers windows/win64/x64 archives (.zip/.7z) or installers (.exe);
+    Linux prefers Linux-X64 archives, then AppImage, with Flatpak as a last
+    resort; macOS prefers mac/osx builds. Returns the asset dict or None.
     """
     if not assets:
         return None
-    win = re.compile(r"win(dows|64|32|-?x?64)?", re.IGNORECASE)
-    ok_ext = (".zip", ".7z", ".exe")
+    platform = platform or sys.platform
+    if platform == "win32":
+        want = re.compile(r"win(dows|64|32|-?x?64)?", re.IGNORECASE)
+        avoid = re.compile(r"(linux|mac|osx|android|flatpak|appimage|arm)", re.IGNORECASE)
+        ok_ext = (".zip", ".7z", ".exe")
+    elif platform == "darwin":
+        want = re.compile(r"(mac|osx|darwin)", re.IGNORECASE)
+        avoid = re.compile(r"(linux|win|android|flatpak|appimage)", re.IGNORECASE)
+        ok_ext = (".zip", ".tar.gz", ".dmg", ".7z")
+    else:  # linux and friends
+        want = re.compile(r"(linux|appimage|x86_64|flatpak)", re.IGNORECASE)
+        avoid = re.compile(r"(win|mac|osx|android|arm64|aarch64)", re.IGNORECASE)
+        ok_ext = (".zip", ".tar.gz", ".appimage", ".7z")
+
+    def ext_ok(name: str) -> bool:
+        return name.lower().endswith(ok_ext)
+
     candidates = [a for a in assets
-                  if win.search(a.get("name", "")) and a.get("name", "").lower().endswith(ok_ext)]
+                  if want.search(a.get("name", "")) and ext_ok(a.get("name", ""))
+                  and not avoid.search(a.get("name", ""))]
     if not candidates:
-        # some releases name the windows build generically; fall back to any archive
-        candidates = [a for a in assets if a.get("name", "").lower().endswith(ok_ext)
-                      and not re.search(r"(linux|mac|osx|android|flatpak|appimage|arm)",
-                                        a.get("name", ""), re.IGNORECASE)]
+        # generically-named builds: any acceptable archive not for another OS
+        candidates = [a for a in assets if ext_ok(a.get("name", ""))
+                      and not avoid.search(a.get("name", ""))]
     if not candidates:
         return None
 
@@ -668,14 +707,31 @@ def pick_windows_asset(assets: list[dict]) -> dict | None:
         s = 0
         if "x64" in n or "win64" in n or "x86_64" in n:
             s += 3
+        if n.endswith(".appimage"):
+            s += 2
         if n.endswith(".zip"):
             s += 2
         elif n.endswith(".7z"):
             s += 1
+        if "flatpak" in n:
+            s -= 2
         return s
 
     candidates.sort(key=score, reverse=True)
     return candidates[0]
+
+
+def reveal_in_file_manager(path: Path):
+    """Open a folder in the OS file manager (best effort, cross-platform)."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        pass
 
 
 class DownloadWorker(QObject):
@@ -698,7 +754,7 @@ class DownloadWorker(QObject):
             r.raise_for_status()
             data = r.json()
             tag = data.get("tag_name", "")
-            asset = pick_windows_asset(data.get("assets", []))
+            asset = pick_release_asset(data.get("assets", []))
             if not asset:
                 self.no_asset.emit(data.get("html_url",
                                    f"https://github.com/{self.repo}/releases"), tag)
@@ -1859,10 +1915,11 @@ class ScanDialog(QDialog):
             self.status.setText("Folder not found.")
             return
         exes = []
-        for p in root.rglob("*.exe"):
-            if SCAN_BLACKLIST.search(p.name):
-                continue
-            exes.append(p)
+        for pattern in ("*.exe", "*.AppImage"):   # AppImage covers Linux libraries
+            for p in root.rglob(pattern):
+                if SCAN_BLACKLIST.search(p.name):
+                    continue
+                exes.append(p)
         recognized = 0
         for p in sorted(exes):
             match = identify_exe(str(p))
@@ -1961,6 +2018,9 @@ class BigPictureWindow(QWidget):
         self._flash_timer.timeout.connect(self._clear_flash)
         self.setWindowTitle(f"{APP_NAME} — Big Picture")
         self.setCursor(Qt.CursorShape.BlankCursor)
+        bg = find_bp_background()
+        self._bg = QPixmap(bg) if bg else QPixmap()
+        self._bg_cache: dict[tuple, QPixmap] = {}
 
     # ----- input -----
     def handle(self, btn: str):
@@ -2042,10 +2102,29 @@ class BigPictureWindow(QWidget):
         r = self.rect()
         t = self.main.theme
 
-        grad = QLinearGradient(0, 0, 0, r.height())
-        grad.setColorAt(0.0, QColor("#0d0d18"))
-        grad.setColorAt(1.0, QColor("#05050a"))
-        p.fillRect(r, QBrush(grad))
+        if not self._bg.isNull():
+            # custom background art, cover-scaled, dimmed for readability
+            key = (r.width(), r.height())
+            pm = self._bg_cache.get(key)
+            if pm is None:
+                pm = self._bg.scaled(r.size(),
+                                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                     Qt.TransformationMode.SmoothTransformation)
+                self._bg_cache.clear()
+                self._bg_cache[key] = pm
+            p.drawPixmap((r.width() - pm.width()) // 2,
+                         (r.height() - pm.height()) // 2, pm)
+            p.fillRect(r, QColor(5, 5, 12, 165))
+            # extra darkening toward the bottom so title/hints stay crisp
+            g2 = QLinearGradient(0, r.height() * 0.55, 0, r.height())
+            g2.setColorAt(0.0, QColor(3, 3, 8, 0))
+            g2.setColorAt(1.0, QColor(3, 3, 8, 215))
+            p.fillRect(r, QBrush(g2))
+        else:
+            grad = QLinearGradient(0, 0, 0, r.height())
+            grad.setColorAt(0.0, QColor("#0d0d18"))
+            grad.setColorAt(1.0, QColor("#05050a"))
+            p.fillRect(r, QBrush(grad))
 
         # brand top-left, counter top-right
         p.setPen(QColor(150, 150, 170))
@@ -2083,11 +2162,15 @@ class BigPictureWindow(QWidget):
                 p.drawPixmap(cx + offset * (gap + sw // 2) - sw // 2, cy - sh // 2, pm)
             p.setOpacity(1.0)
 
-        # center cover with shadow plate + accent frame
+        # center cover with soft accent glow + shadow plate + accent frame
         pm = art_for(g, cw, ch)
         x, y = cx - cw // 2, cy - ch // 2
+        glow = QColor(t["accent"])
+        glow.setAlpha(60)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 0, 0, 130))
+        p.setBrush(glow)
+        p.drawRoundedRect(QRectF(x - 16, y - 16, cw + 32, ch + 32), 18, 18)
+        p.setBrush(QColor(0, 0, 0, 150))
         p.drawRoundedRect(QRectF(x - 10, y - 10, cw + 20, ch + 20), 14, 14)
         p.drawPixmap(x, y, pm)
         p.setPen(QPen(QColor(t["accent"]), 3))
@@ -2870,16 +2953,13 @@ class LauncherWindow(QMainWindow):
                     self._render_details(gg)
             self.statusBar().clearMessage()
             self.toast(f"Downloaded {tag or 'latest'} → {Path(path).name}")
-            try:
-                os.startfile(str(Path(path).parent))    # reveal in Explorer
-            except Exception:
-                pass
+            reveal_in_file_manager(Path(path).parent)
             self.download_btn.setEnabled(True)
 
         def on_no_asset(url, tag):
             self.statusBar().clearMessage()
             webbrowser.open(url)
-            self.toast("No Windows build in the release — opened the downloads page.")
+            self.toast("No build for this OS in the release — opened the downloads page.")
             self.download_btn.setEnabled(True)
 
         def on_failed(msg):
