@@ -30,6 +30,7 @@ all in one place. Built for the recomp scene.
 - **⬇ One-click downloads** — grab the latest Windows build of any game straight from its GitHub release. Perfect if you're new to recomps.
 - **⬆ Update checking** — checks each game's GitHub releases on launch and badges any card with an available update.
 - **⏱ Playtime tracking** — playtime, last-played, and launch counts, tracked automatically.
+- **🏆 RetroAchievements** — link your RA account and every game gets a 🏆 tab showing the official achievement set and your unlocks. Game IDs auto-match by title.
 - **🚀 Launch profiles** — per-game command-line profiles for mods, configs, and save slots.
 - **🎮 Controller support** — Xbox (XInput) **and** PlayStation (DualSense / DualShock 4, USB or Bluetooth) pads work out of the box, no setup: browse the grid, launch games, and drive Big Picture from the couch.
 - **🖥 Big Picture mode** — a fullscreen, controller-first view (`F11` or the Start button) with giant cover art, Steam-style. **A** to play, **B** to exit, **Y** to favorite.
@@ -91,6 +92,23 @@ Auto-identified out of the box (the list lives in `KNOWN_RECOMPS` in [`recomplau
 | Jak and Daxter | OpenGOAL | PS2 |
 
 **Adding a recomp is a one-entry change** — see [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome!
+
+---
+
+## 🏆 RetroAchievements
+
+Paste your RA username and [Web API key](https://retroachievements.org/settings) into
+**Settings**, and each game's **🏆 tab** shows the official RetroAchievements set with
+your unlock progress. IDs auto-match by title (override per game via Edit → Find…).
+
+**Honest caveat:** no recomp can *earn* RetroAchievements today. RA hooks emulator
+memory, and [treats native ports as standalone games](https://docs.retroachievements.org/general/standalone-support.html)
+whose developers must integrate support themselves — none have yet
+([Zelda64Recomp has an open request](https://github.com/Zelda64Recomp/Zelda64Recomp/issues/506)).
+Unlocks shown here are the ones you earn playing through an RA-enabled emulator.
+Notably, **Unleashed Recompiled ships its own built-in achievement system** (a native
+recreation of the Xbox 360 set) — no launcher setup needed there. If a recomp adds
+official RA support later, this launcher is ready to meet it.
 
 ---
 

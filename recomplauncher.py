@@ -53,9 +53,10 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ART_DIR = DATA_DIR / "art"
 SHOTS_DIR = DATA_DIR / "screenshots"
+RA_ICON_DIR = DATA_DIR / "ra_icons"
 GAMES_FILE = DATA_DIR / "games.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
-for _d in (DATA_DIR, ART_DIR, SHOTS_DIR):
+for _d in (DATA_DIR, ART_DIR, SHOTS_DIR, RA_ICON_DIR):
     _d.mkdir(exist_ok=True)
 
 USER_AGENT = "ReCompLauncher/0.2 (https://github.com/)"
@@ -325,6 +326,7 @@ def blank_game(title: str = "") -> dict:
         "github_repo": "",
         "installed_version": "",
         "latest_version": "",
+        "ra_game_id": "",
         "tags": [],
         "favorite": False,
         "playtime_seconds": 0,
@@ -402,6 +404,8 @@ def load_settings() -> dict:
     s.setdefault("card_scale", 100)       # percent
     s.setdefault("minimize_to_tray", False)
     s.setdefault("check_updates_on_launch", True)
+    s.setdefault("ra_username", "")
+    s.setdefault("ra_api_key", "")
     return s
 
 
@@ -718,6 +722,109 @@ class DownloadWorker(QObject):
             self.finished.emit(str(dest), tag)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+# ======================================================================
+# RetroAchievements (Web API viewer)
+# ----------------------------------------------------------------------
+# No recomp can *earn* RA achievements today (RA hooks emulator memory and
+# treats native ports as standalone games needing their own integration),
+# but the public Web API lets us show each game's official achievement set
+# and the user's unlocks earned via emulators. Username + Web API key go
+# in Settings; game IDs are auto-matched by title where possible.
+# ======================================================================
+
+RA_API = "https://retroachievements.org/API"
+RA_MEDIA = "https://media.retroachievements.org"
+
+# tag hint -> RetroAchievements console id, for auto-matching game IDs
+_RA_CONSOLES = {"N64": 2, "SNES": 3, "GameCube": 16, "PS2": 21}
+
+
+def _ra_norm_title(s: str) -> str:
+    """Normalize a title for matching. RA uses 'Legend of Zelda, The: ...'
+    style, so ', the' and a leading 'the' both collapse away."""
+    s = s.lower().replace(", the", " ")
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return re.sub(r"^the", "", s)
+
+
+class RAWorker(QObject):
+    """Fetch a game's RetroAchievements set + the user's progress."""
+    finished = pyqtSignal(str, dict)     # library game id, payload
+    failed = pyqtSignal(str, str)        # library game id, message
+
+    def __init__(self, lib_id: str, title: str, tags: list[str],
+                 ra_game_id: str, username: str, api_key: str):
+        super().__init__()
+        self.lib_id = lib_id
+        self.title = title
+        self.tags = tags
+        self.ra_game_id = str(ra_game_id or "").strip()
+        self.username = username
+        self.api_key = api_key
+
+    def _lookup_id(self) -> str:
+        console = next((cid for tag, cid in _RA_CONSOLES.items()
+                        if tag in self.tags), None)
+        if console is None:
+            return ""
+        r = requests.get(f"{RA_API}/API_GetGameList.php",
+                         params={"y": self.api_key, "i": console, "f": 1},
+                         headers={"User-Agent": USER_AGENT}, timeout=30)
+        r.raise_for_status()
+        want = _ra_norm_title(self.title)
+        for entry in r.json():
+            if _ra_norm_title(str(entry.get("Title", ""))) == want:
+                return str(entry.get("ID", ""))
+        return ""
+
+    def run(self):
+        try:
+            rid = self.ra_game_id or self._lookup_id()
+            if not rid:
+                self.failed.emit(self.lib_id,
+                                 "No RetroAchievements match found — set the "
+                                 "game's RA ID in Edit (use Find…).")
+                return
+            r = requests.get(f"{RA_API}/API_GetGameInfoAndUserProgress.php",
+                             params={"y": self.api_key, "u": self.username,
+                                     "g": rid, "a": 1},
+                             headers={"User-Agent": USER_AGENT}, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            achs = data.get("Achievements") or {}
+            out = []
+            for a in achs.values():
+                badge = str(a.get("BadgeName", ""))
+                earned = bool(a.get("DateEarned") or a.get("DateEarnedHardcore"))
+                icon = ""
+                if badge:
+                    suffix = "" if earned else "_lock"
+                    dest = RA_ICON_DIR / f"{badge}{suffix}.png"
+                    if not dest.exists():
+                        download_image(f"{RA_MEDIA}/Badge/{badge}{suffix}.png", dest)
+                    if dest.exists():
+                        icon = str(dest)
+                out.append({
+                    "title": a.get("Title", ""),
+                    "desc": a.get("Description", ""),
+                    "points": a.get("Points", 0),
+                    "earned": earned,
+                    "order": a.get("DisplayOrder") or 0,
+                    "icon": icon,
+                })
+            out.sort(key=lambda x: (x["order"], str(x["title"])))
+            self.finished.emit(self.lib_id, {
+                "ra_id": rid,
+                "game_title": data.get("Title", "") or self.title,
+                "total": int(data.get("NumAchievements") or len(out)),
+                "earned": int(data.get("NumAwardedToUser") or 0),
+                "completion": str(data.get("UserCompletion", "") or "").strip(),
+                "achievements": out,
+            })
+        except Exception as e:
+            self.failed.emit(self.lib_id, str(e))
 
 
 # ======================================================================
@@ -1530,6 +1637,11 @@ class EditGameDialog(QDialog):
         self.repo_edit.setPlaceholderText("owner/repo  (for update checks)")
         self.version_edit = QLineEdit(game.get("installed_version", ""))
 
+        self.ra_edit = QLineEdit(str(game.get("ra_game_id", "")))
+        self.ra_edit.setPlaceholderText("numeric ID — auto-matched when possible")
+        ra_find = QPushButton("Find…")
+        ra_find.clicked.connect(self._find_ra)
+
         self.art_edit = QLineEdit(game.get("art_path", ""))
         art_btn = QPushButton("Browse…"); art_btn.clicked.connect(self._browse_art)
         art_url = QPushButton("URL…"); art_url.clicked.connect(self._art_from_url)
@@ -1557,6 +1669,7 @@ class EditGameDialog(QDialog):
         form.addRow("Tags (comma sep):", self.tags_edit)
         form.addRow("GitHub repo:", self.repo_edit)
         form.addRow("Installed version:", self.version_edit)
+        form.addRow("RetroAchievements ID:", self._row(self.ra_edit, ra_find))
         form.addRow("Box art file:", art_wrap)
         form.addRow("Search name:", self.search_edit)
         form.addRow("Description:", self.desc_edit)
@@ -1600,6 +1713,11 @@ class EditGameDialog(QDialog):
         else:
             QMessageBox.warning(self, "Download failed", "Could not download that URL.")
 
+    def _find_ra(self):
+        q = urllib.parse.quote(self.search_edit.text().strip()
+                               or self.title_edit.text().strip())
+        webbrowser.open(f"https://retroachievements.org/searchresults.php?s={q}&t=1")
+
     def result_game(self) -> dict:
         profiles = []
         for line in self.profiles_edit.toPlainText().splitlines():
@@ -1622,6 +1740,7 @@ class EditGameDialog(QDialog):
             "tags": tags,
             "github_repo": self.repo_edit.text().strip(),
             "installed_version": self.version_edit.text().strip(),
+            "ra_game_id": self.ra_edit.text().strip(),
             "art_path": self.art_edit.text().strip(),
             "search_name": self.search_edit.text().strip(),
             "description": self.desc_edit.toPlainText().strip(),
@@ -1650,17 +1769,27 @@ class SettingsDialog(QDialog):
         self.launch_check = QCheckBox("Check for updates on launch")
         self.launch_check.setChecked(settings.get("check_updates_on_launch", True))
 
+        self.ra_user_edit = QLineEdit(settings.get("ra_username", ""))
+        self.ra_user_edit.setPlaceholderText("RetroAchievements username")
+        self.ra_key_edit = QLineEdit(settings.get("ra_api_key", ""))
+        self.ra_key_edit.setPlaceholderText("Web API key — see link above")
+
         info = QLabel(
             "<b>Fetch Info</b> uses <a href='https://en.wikipedia.org'>Wikipedia</a> "
             "for descriptions and box art — no setup needed.<br>"
             "For curated cover art, paste a free "
-            "<a href='https://www.steamgriddb.com/profile/preferences/api'>SteamGridDB API key</a>.")
+            "<a href='https://www.steamgriddb.com/profile/preferences/api'>SteamGridDB API key</a>.<br>"
+            "<b>RetroAchievements</b> (optional): shows each game's official RA set and "
+            "your unlocks in the 🏆 tab. Get your Web API key at "
+            "<a href='https://retroachievements.org/settings'>retroachievements.org/settings</a>.")
         info.setOpenExternalLinks(True)
         info.setWordWrap(True)
 
         form = QFormLayout()
         form.addRow("Theme:", self.theme_combo)
         form.addRow("SteamGridDB key:", self.sgdb_edit)
+        form.addRow("RA username:", self.ra_user_edit)
+        form.addRow("RA API key:", self.ra_key_edit)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                                 | QDialogButtonBox.StandardButton.Cancel)
@@ -1679,6 +1808,8 @@ class SettingsDialog(QDialog):
         self.settings["sgdb_api_key"] = self.sgdb_edit.text().strip()
         self.settings["minimize_to_tray"] = self.tray_check.isChecked()
         self.settings["check_updates_on_launch"] = self.launch_check.isChecked()
+        self.settings["ra_username"] = self.ra_user_edit.text().strip()
+        self.settings["ra_api_key"] = self.ra_key_edit.text().strip()
         return self.settings
 
 
@@ -2030,6 +2161,7 @@ class LauncherWindow(QMainWindow):
         self.selected_id: str | None = None
         self.running: dict[str, tuple] = {}   # id -> (Popen, start_monotonic)
         self._threads = []                    # keep refs alive
+        self._ra_cache: dict[str, dict] = {}  # library id -> RA payload (session)
 
         self._build_ui()
         self._build_tray()
@@ -2167,6 +2299,23 @@ class LauncherWindow(QMainWindow):
         il.addRow("GitHub:", self.info_repo)
         il.addRow("Updates:", self.info_update)
         self.tabs.addTab(info_tab, "Info")
+        # RetroAchievements
+        ra_tab = QWidget()
+        rl = QVBoxLayout(ra_tab)
+        rl.setContentsMargins(0, 8, 0, 0)
+        ra_head = QHBoxLayout()
+        self.ra_status = QLabel("")
+        self.ra_status.setWordWrap(True)
+        ra_head.addWidget(self.ra_status, 1)
+        self.ra_btn = QPushButton("Load")
+        self.ra_btn.clicked.connect(self.load_ra_achievements)
+        ra_head.addWidget(self.ra_btn)
+        rl.addLayout(ra_head)
+        self.ra_list = QListWidget()
+        self.ra_list.setIconSize(QSize(32, 32))
+        self.ra_list.setWordWrap(True)
+        rl.addWidget(self.ra_list, 1)
+        self.tabs.addTab(ra_tab, "🏆 RA")
         bl.addWidget(self.tabs, 1)
 
         # profile + play row
@@ -2324,6 +2473,7 @@ class LauncherWindow(QMainWindow):
         else:
             self.info_repo.setText("—")
         self._render_update_label(g)
+        self._render_ra(g)
         # profiles
         self.profile_combo.clear()
         self.profile_combo.addItem("Default")
@@ -2825,6 +2975,82 @@ class LauncherWindow(QMainWindow):
             self.settings = dlg.result_settings()
             save_settings(self.settings)
             self.apply_theme()
+
+    # ---------------- retroachievements ----------------
+    def _render_ra(self, g: dict):
+        self.ra_list.clear()
+        payload = self._ra_cache.get(g["id"])
+        if payload:
+            self._fill_ra(payload)
+            return
+        self.ra_btn.setText("Load")
+        self.ra_btn.setEnabled(True)
+        if self.settings.get("ra_username") and self.settings.get("ra_api_key"):
+            self.ra_status.setText("Click Load to fetch this game's RetroAchievements "
+                                   "set and your progress.")
+        else:
+            self.ra_status.setText("Set your RetroAchievements username + Web API key "
+                                   "in Settings to use this tab.")
+
+    def _fill_ra(self, payload: dict):
+        pct = f"  ({payload['completion']})" if payload.get("completion") else ""
+        self.ra_status.setText(
+            f"<b>{payload['game_title']}</b> — "
+            f"{payload['earned']}/{payload['total']} unlocked{pct}")
+        self.ra_btn.setText("Refresh")
+        self.ra_btn.setEnabled(True)
+        self.ra_list.clear()
+        for a in payload["achievements"]:
+            mark = "✓" if a["earned"] else "🔒"
+            item = QListWidgetItem(f"{mark} {a['title']}  ·  {a['points']} pts\n{a['desc']}")
+            if a["icon"]:
+                item.setIcon(QIcon(a["icon"]))
+            if not a["earned"]:
+                item.setForeground(QColor(self.theme["subtext"]))
+            self.ra_list.addItem(item)
+
+    def load_ra_achievements(self):
+        if not self.selected_id:
+            return
+        g = self._game(self.selected_id)
+        if not g:
+            return
+        user = self.settings.get("ra_username", "").strip()
+        key = self.settings.get("ra_api_key", "").strip()
+        if not user or not key:
+            self.toast("Set your RetroAchievements username + API key in Settings.")
+            return
+        self.ra_btn.setEnabled(False)
+        self.ra_status.setText("Fetching from RetroAchievements…")
+        thread = QThread()
+        worker = RAWorker(g["id"], g.get("search_name") or g.get("title", ""),
+                          list(g.get("tags", [])), g.get("ra_game_id", ""), user, key)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_ra_done)
+        worker.failed.connect(self._on_ra_failed)
+        for sig in (worker.finished, worker.failed):
+            sig.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._threads.append((thread, worker))
+        thread.start()
+
+    def _on_ra_done(self, lib_id: str, payload: dict):
+        self._ra_cache[lib_id] = payload
+        g = self._game(lib_id)
+        if g and payload.get("ra_id") and g.get("ra_game_id") != payload["ra_id"]:
+            g["ra_game_id"] = payload["ra_id"]     # remember the auto-match
+            self._persist()
+        if lib_id == self.selected_id:
+            self._fill_ra(payload)
+
+    def _on_ra_failed(self, lib_id: str, msg: str):
+        if lib_id == self.selected_id:
+            self.ra_btn.setEnabled(True)
+            self.ra_btn.setText("Load")
+            self.ra_status.setText(f"RetroAchievements: {msg}")
 
     # ---------------- big picture / controller ----------------
     def toggle_big_picture(self):
