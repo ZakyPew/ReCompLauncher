@@ -121,6 +121,14 @@ KNOWN_RECOMPS: list[dict] = [
         "github_repo": "fgsfdsfgs/perfect_dark", "tags": ["Rare", "N64"],
     },
     {
+        "names": ["battletanxga.exe"], "patterns": ["battletanxga"],
+        "title": "BattleTanx: Global Assault",
+        "platform": "BattleTanx: Global Assault PC Port",
+        "search": "BattleTanx: Global Assault",
+        "github_repo": "TheGh0stShip/BattleTanx-Global-Assault-PC-Port",
+        "tags": ["BattleTanx", "N64", "Recompiled"],
+    },
+    {
         "names": ["banjorecompiled.exe", "banjo.exe"], "patterns": ["banjorecomp", "banjo"],
         "title": "Banjo-Kazooie",
         "platform": "Banjo: Recompiled", "search": "Banjo-Kazooie",
