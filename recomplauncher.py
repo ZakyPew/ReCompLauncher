@@ -133,7 +133,7 @@ KNOWN_RECOMPS: list[dict] = [
         "github_repo": "klorfmorf/Goemon64Recomp", "tags": ["Goemon", "N64", "Recompiled"],
     },
     {
-        "names": ["adams-ant-farm.exe", "adams-ant-farm-eu.exe"], "patterns": ["adams-ant-farm"],
+        "names": ["adams-ant-farm.exe", "adams-ant-farm-eu.exe", "bh-launcher.exe"], "patterns": ["adams-ant-farm"],
         "title": "Body Harvest",
         "platform": "Adam's Ant Farm", "search": "Body Harvest",
         "github_repo": "LunarLaurus/adams-ant-farm-recomp", "tags": ["Body Harvest", "N64", "Recompiled"],
