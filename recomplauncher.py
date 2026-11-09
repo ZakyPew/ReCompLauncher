@@ -743,7 +743,7 @@ def pick_release_asset(assets: list[dict], platform: str | None = None) -> dict 
     platform = platform or sys.platform
     if platform == "win32":
         want = re.compile(r"win(dows|64|32|-?x?64)?", re.IGNORECASE)
-        avoid = re.compile(r"(linux|mac|osx|android|flatpak|appimage|arm)", re.IGNORECASE)
+        avoid = re.compile(r"(linux|mac|osx|android|flatpak|appimage|(?<![a-z])arm)", re.IGNORECASE)
         ok_ext = (".zip", ".7z", ".exe")
     elif platform == "darwin":
         want = re.compile(r"(mac|osx|darwin)", re.IGNORECASE)
