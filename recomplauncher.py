@@ -133,6 +133,12 @@ KNOWN_RECOMPS: list[dict] = [
         "github_repo": "klorfmorf/Goemon64Recomp", "tags": ["Goemon", "N64", "Recompiled"],
     },
     {
+        "names": ["adams-ant-farm.exe", "adams-ant-farm-eu.exe"], "patterns": ["adams-ant-farm"],
+        "title": "Body Harvest",
+        "platform": "Adam's Ant Farm", "search": "Body Harvest",
+        "github_repo": "LunarLaurus/adams-ant-farm-recomp", "tags": ["Body Harvest", "N64", "Recompiled"],
+    },
+    {
         # Dusk: reverse-engineered reimplementation of Twilight Princess (GameCube),
         # built on the Aurora engine. Patterns kept specific to avoid matching the
         # unrelated "DUSK" retro FPS.
