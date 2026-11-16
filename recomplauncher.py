@@ -152,7 +152,7 @@ KNOWN_RECOMPS: list[dict] = [
         "names": ["triforce.exe"], "patterns": ["triforce", "nx2navi"],
         "title": "The Legend of Zelda: Ocarina of Time",
         "platform": "Triforce", "search": "The Legend of Zelda: Ocarina of Time",
-        "github_repo": "", "tags": ["Zelda", "N64"],
+        "github_repo": "", "tags": ["Zelda", "Switch 2"],
     },
     {
         "names": ["2ship.exe", "2s2h.exe"], "patterns": ["2ship", "2s2h"],

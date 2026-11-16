@@ -90,7 +90,7 @@ Auto-identified out of the box (the list lives in `KNOWN_RECOMPS` in [`recomplau
 | Game | Project | Platform |
 |------|---------|----------|
 | Ocarina of Time | Ship of Harkinian | N64 |
-| Ocarina of Time | [Triforce](https://triforceproject.com/) (identify only — not hosted on GitHub) | N64 |
+| Ocarina of Time | [Triforce](https://triforceproject.com/) (identify only — not hosted on GitHub) | Switch 2 |
 | Majora's Mask | 2 Ship 2 Harkinian / Zelda64Recompiled | N64 |
 | Star Fox 64 | Starship | N64 |
 | Perfect Dark | perfect_dark | N64 |

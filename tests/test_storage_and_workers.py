@@ -146,6 +146,7 @@ class FolderScan(_TempDataCase):
         match = launcher.identify_exe(r"C:\Games\Triforce\Triforce.exe".replace("\\", "/"))
         self.assertEqual(match["platform"], "Triforce")
         self.assertEqual(match["title"], "The Legend of Zelda: Ocarina of Time")
+        self.assertEqual(match["tags"], ["Zelda", "Switch 2"])
 
 
 class _Response:
