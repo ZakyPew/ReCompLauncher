@@ -48,6 +48,7 @@ python recomplauncher.py
 - Single-file app by design — keep it approachable.
 - Match the surrounding style (standard library + PyQt6 + requests, no heavy deps).
 - Test that the app still launches before opening a PR.
+- Run the tests: `python -m unittest discover -s tests` (CI runs them on every PR).
 
 ## Reporting bugs / requesting games
 
