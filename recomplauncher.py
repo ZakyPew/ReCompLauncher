@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,12 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+try:                                  # optional: OS credential store for API keys
+    import keyring
+except Exception:                     # not installed / unusable — fall back to the file
+    keyring = None
+
 from PyQt6.QtCore import (
     Qt, QSize, QThread, pyqtSignal, QObject, QAbstractListModel, QModelIndex,
     QMimeData, QByteArray, QRect, QRectF, QTimer, QPropertyAnimation, QPoint,
@@ -48,19 +55,63 @@ from PyQt6.QtWidgets import (
 # ======================================================================
 
 APP_NAME = "ReComp Launcher"
+APP_VERSION = "0.3.0"
+REPO_URL = "https://github.com/ZakyPew/ReCompLauncher"
 SUPPORT_URL = "https://buymeacoffee.com/zikuju"
 DISCORD_URL = "https://discord.gg/QppkNN4rb3"
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
+
+
+def _user_data_dir() -> Path:
+    """Per-user data folder, used when the folder next to the app is read-only."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / "ReCompLauncher"
+
+
+def resolve_data_dir() -> Path:
+    """Where the library, art and settings live.
+
+    From source that is ``data/`` next to the script. A frozen (PyInstaller)
+    build must NOT use ``__file__``: in a one-file build that points into a
+    temporary extraction folder that is deleted on exit, taking the library
+    with it. There we use ``data/`` next to the executable instead, falling
+    back to a per-user folder when that location is not writable.
+    """
+    if getattr(sys, "frozen", False):
+        home = Path(sys.executable).resolve().parent
+    else:
+        home = APP_DIR
+    for candidate in (home / "data", _user_data_dir()):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+    return home / "data"
+
+
+DATA_DIR = resolve_data_dir()
 ART_DIR = DATA_DIR / "art"
 SHOTS_DIR = DATA_DIR / "screenshots"
 RA_ICON_DIR = DATA_DIR / "ra_icons"
 GAMES_FILE = DATA_DIR / "games.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+UPDATE_CACHE_FILE = DATA_DIR / "update_cache.json"
 for _d in (DATA_DIR, ART_DIR, SHOTS_DIR, RA_ICON_DIR):
-    _d.mkdir(exist_ok=True)
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
-USER_AGENT = "ReCompLauncher/0.2 (https://github.com/)"
+USER_AGENT = f"ReCompLauncher/{APP_VERSION} ({REPO_URL})"
 
 # Custom item-data roles
 ROLE_GAME = Qt.ItemDataRole.UserRole + 1
@@ -94,6 +145,14 @@ KNOWN_RECOMPS: list[dict] = [
         "title": "The Legend of Zelda: Ocarina of Time",
         "platform": "Ship of Harkinian", "search": "The Legend of Zelda: Ocarina of Time",
         "github_repo": "HarbourMasters/Shipwright", "tags": ["Zelda", "N64"],
+    },
+    {
+        # Triforce (formerly NX2navi) is hosted on its own site and git server,
+        # not GitHub, so it has no github_repo: no in-app download/update check.
+        "names": ["triforce.exe"], "patterns": ["triforce", "nx2navi"],
+        "title": "The Legend of Zelda: Ocarina of Time",
+        "platform": "Triforce", "search": "The Legend of Zelda: Ocarina of Time",
+        "github_repo": "", "tags": ["Zelda", "N64"],
     },
     {
         "names": ["2ship.exe", "2s2h.exe"], "patterns": ["2ship", "2s2h"],
@@ -277,6 +336,56 @@ KNOWN_RECOMPS: list[dict] = [
 ]
 
 
+def is_known_exe_name(name: str) -> bool:
+    """True when a file name is an exact KNOWN_RECOMPS executable name."""
+    name = name.lower()
+    return any(name in entry["names"] or f"{name}.exe" in entry["names"]
+               for entry in KNOWN_RECOMPS)
+
+
+def _looks_like_native_binary(path: Path) -> bool:
+    """An executable ELF file that is not a shared library (Linux builds)."""
+    name = path.name.lower()
+    if ".so" in name or path.suffix.lower() in (".dll", ".dylib", ".sh", ".py"):
+        return False
+    try:
+        if not os.access(path, os.X_OK):
+            return False
+        with path.open("rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def find_game_executables(root: Path, platform: str | None = None,
+                          cancelled=None) -> list[Path]:
+    """Walk a folder for things that could be a game's executable.
+
+    Everywhere: ``*.exe`` and ``*.AppImage``. Off Windows, also executable
+    ELF binaries, since most Linux builds ship without an extension. Helper
+    programs (installers, updaters, crash reporters…) are skipped by
+    SCAN_BLACKLIST — unless the file name is one a known recomp ships, which
+    always wins. ``cancelled`` is an optional callable polled between folders.
+    """
+    platform = platform or sys.platform
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if cancelled and cancelled():
+            break
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for filename in filenames:
+            p = Path(dirpath) / filename
+            lower = filename.lower()
+            known = is_known_exe_name(filename)
+            if not known and SCAN_BLACKLIST.search(filename):
+                continue
+            if lower.endswith((".exe", ".appimage")):
+                found.append(p)
+            elif platform != "win32" and (known or _looks_like_native_binary(p)):
+                found.append(p)
+    return sorted(found)
+
+
 def identify_exe(exe_path: str) -> dict | None:
     """Return the matching KNOWN_RECOMPS entry for an executable, or None."""
     p = Path(exe_path)
@@ -284,7 +393,7 @@ def identify_exe(exe_path: str) -> dict | None:
     stem = p.stem.lower()
     parent = p.parent.name.lower()
     for entry in KNOWN_RECOMPS:
-        if name in entry["names"]:
+        if name in entry["names"] or f"{name}.exe" in entry["names"]:
             return entry
     for entry in KNOWN_RECOMPS:                  # second pass: fuzzy patterns
         for pat in entry.get("patterns", []):
@@ -420,13 +529,41 @@ def blank_game(title: str = "") -> dict:
 # Persistence
 # ======================================================================
 
-def load_json(path: Path, default: Any) -> Any:
+# Problems found while loading data files, shown to the user once the window is up.
+LOAD_WARNINGS: list[str] = []
+
+
+def _quarantine(path: Path) -> Path | None:
+    """Move an unreadable data file aside so it is never overwritten."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        path.replace(backup)
+        return backup
+    except OSError:
+        return None
+
+
+def load_json(path: Path, default: Any, expect: type | None = None) -> Any:
+    """Read a JSON file, returning ``default`` when it is missing.
+
+    A file that exists but cannot be parsed (or holds the wrong top-level
+    type) is renamed to ``<name>.corrupt-<timestamp>`` and reported through
+    LOAD_WARNINGS, rather than being silently replaced by the defaults.
+    """
     if not path.exists():
         return default
     try:
         with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        if expect is not None and not isinstance(data, expect):
+            raise ValueError(f"expected a JSON {expect.__name__}")
+        return data
+    except Exception as e:
+        backup = _quarantine(path)
+        where = f"A copy was kept as {backup.name}." if backup else \
+            "It could not be backed up."
+        LOAD_WARNINGS.append(f"{path.name} could not be read ({e}). {where}")
         return default
 
 
@@ -434,6 +571,11 @@ def save_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     tmp.replace(path)
 
 
@@ -457,7 +599,7 @@ def migrate_game(g: dict) -> dict:
 
 
 def load_library() -> list[dict]:
-    games = load_json(GAMES_FILE, None)
+    games = load_json(GAMES_FILE, None, expect=list)
     if games is None:
         games = []
         for g in DEFAULT_GAMES:
@@ -469,27 +611,104 @@ def load_library() -> list[dict]:
             games.append(ng)
         save_json(GAMES_FILE, games)
         return games
-    return [migrate_game(g) for g in games]
+    return [migrate_game(g) for g in games if isinstance(g, dict)]
 
 
 def save_library(games: list[dict]) -> None:
     save_json(GAMES_FILE, games)
 
 
+# ---- API keys ---------------------------------------------------------
+# Secrets live in the OS credential store (Windows Credential Manager, macOS
+# Keychain, Secret Service / KWallet on Linux) through the optional `keyring`
+# package, not in settings.json. Where no store is available the key stays in
+# settings.json, as before, with the file restricted to the current user.
+
+SECRET_KEYS = ("sgdb_api_key", "ra_api_key")
+KEYRING_SERVICE = "ReCompLauncher"
+# What the credential store is known to hold, so we only write on a change.
+_stored_secrets: dict[str, str] = {}
+
+
+def secret_get(name: str) -> str | None:
+    """Read a secret from the OS store. None means the store is unavailable."""
+    if keyring is None:
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE, name) or ""
+    except Exception:
+        return None
+
+
+def secret_set(name: str, value: str) -> bool:
+    """Store (or, for an empty value, remove) a secret. False if unavailable."""
+    if keyring is None:
+        return False
+    try:
+        if value:
+            keyring.set_password(KEYRING_SERVICE, name, value)
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, name)
+            except keyring.errors.PasswordDeleteError:
+                pass                      # nothing was stored
+        return True
+    except Exception:
+        return False
+
+
+def secrets_in_keyring() -> bool:
+    """True when API keys are being kept in the OS credential store."""
+    return secret_get(SECRET_KEYS[0]) is not None
+
+
 def load_settings() -> dict:
-    s = load_json(SETTINGS_FILE, {})
-    s.setdefault("sgdb_api_key", "")
+    s = load_json(SETTINGS_FILE, {}, expect=dict)
+    migrated = False
+    for name in SECRET_KEYS:
+        in_file = str(s.get(name) or "").strip()
+        if in_file:
+            # a key left in settings.json by an older version: move it across
+            if secret_set(name, in_file):
+                _stored_secrets[name] = in_file
+                migrated = True
+            s[name] = in_file
+        else:
+            stored = secret_get(name)
+            if stored is not None:
+                _stored_secrets[name] = stored
+            s[name] = stored or ""
     s.setdefault("theme", "Dracula")
     s.setdefault("card_scale", 100)       # percent
     s.setdefault("minimize_to_tray", False)
     s.setdefault("check_updates_on_launch", True)
     s.setdefault("ra_username", "")
-    s.setdefault("ra_api_key", "")
+    if migrated:
+        try:
+            save_settings(s)              # rewrite the file without the keys
+        except OSError:
+            pass
     return s
 
 
 def save_settings(s: dict) -> None:
-    save_json(SETTINGS_FILE, s)
+    on_disk = dict(s)
+    for name in SECRET_KEYS:
+        value = str(s.get(name) or "").strip()
+        if _stored_secrets.get(name) == value:
+            on_disk.pop(name, None)       # already in the credential store
+        elif secret_set(name, value):
+            _stored_secrets[name] = value
+            on_disk.pop(name, None)
+        else:
+            _stored_secrets.pop(name, None)
+            on_disk[name] = value         # no store available: keep in the file
+    save_json(SETTINGS_FILE, on_disk)
+    if os.name == "posix":
+        try:
+            os.chmod(SETTINGS_FILE, 0o600)
+        except OSError:
+            pass
 
 
 # ======================================================================
@@ -716,32 +935,84 @@ class FetchWorker(QObject):
             self.finished.emit(result)
 
 
+def github_rate_limit_message(response) -> str | None:
+    """If a GitHub response is a rate-limit refusal, describe it; else None."""
+    if response.status_code not in (403, 429):
+        return None
+    if response.headers.get("x-ratelimit-remaining") != "0" \
+            and "retry-after" not in response.headers:
+        return None
+    try:
+        reset = datetime.fromtimestamp(int(response.headers["x-ratelimit-reset"]))
+        when = f" Try again after {reset.strftime('%H:%M')}."
+    except (KeyError, ValueError, OSError, OverflowError):
+        when = " Try again later."
+    return "GitHub's hourly request limit was reached." + when
+
+
 class UpdateWorker(QObject):
-    """Check the latest GitHub release tag for one or more games."""
+    """Check the latest GitHub release tag for one or more games.
+
+    Each repository is asked once however many games share it, and requests
+    are conditional (``If-None-Match``): an unchanged release answers 304,
+    which GitHub does not count against the 60-per-hour anonymous limit.
+    """
     one = pyqtSignal(str, str)        # game_id, latest_tag
     done = pyqtSignal(int)            # number checked
-    failed = pyqtSignal(str)
+    rate_limited = pyqtSignal(str)    # human-readable message
 
-    def __init__(self, jobs: list[tuple[str, str]]):
+    def __init__(self, jobs: list[tuple[str, str]], cache_file: Path | None = None):
         super().__init__()
         self.jobs = jobs              # [(game_id, repo)]
+        self.cache_file = cache_file or UPDATE_CACHE_FILE
+        self.cancelled = False
+
+    def _latest_tag(self, repo: str, cache: dict) -> str:
+        """Latest release tag for a repo ('' if it has no releases)."""
+        key = repo.lower()
+        known = cache.get(key) if isinstance(cache.get(key), dict) else {}
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+        if known.get("etag"):
+            headers["If-None-Match"] = known["etag"]
+        r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest",
+                         headers=headers, timeout=15)
+        if r.status_code == 304:
+            return known.get("tag", "")
+        if r.status_code == 404:
+            return ""
+        limited = github_rate_limit_message(r)
+        if limited:
+            raise RuntimeError(limited)
+        r.raise_for_status()
+        tag = r.json().get("tag_name", "")
+        if tag and r.headers.get("ETag"):
+            cache[key] = {"etag": r.headers["ETag"], "tag": tag}
+        return tag
 
     def run(self):
+        cache = load_json(self.cache_file, {}, expect=dict)
+        tags: dict[str, str] = {}     # repo (lowercase) -> tag, one request each
         checked = 0
         for game_id, repo in self.jobs:
-            try:
-                r = requests.get(f"https://api.github.com/repos/{repo}/releases/latest",
-                                 headers={"User-Agent": USER_AGENT,
-                                          "Accept": "application/vnd.github+json"}, timeout=15)
-                if r.status_code == 404:
-                    continue
-                r.raise_for_status()
-                tag = r.json().get("tag_name", "")
-                if tag:
-                    self.one.emit(game_id, tag)
-                    checked += 1
-            except Exception:
-                continue
+            if self.cancelled:
+                break
+            repo = repo.strip()
+            key = repo.lower()
+            if key not in tags:
+                try:
+                    tags[key] = self._latest_tag(repo, cache)
+                except RuntimeError as e:          # rate limited: stop asking
+                    self.rate_limited.emit(str(e))
+                    break
+                except Exception:
+                    tags[key] = ""
+            if tags[key]:
+                self.one.emit(game_id, tags[key])
+                checked += 1
+        try:
+            save_json(self.cache_file, cache)
+        except OSError:
+            pass
         self.done.emit(checked)
 
 
@@ -800,6 +1071,21 @@ def pick_release_asset(assets: list[dict], platform: str | None = None) -> dict 
     return candidates[0]
 
 
+def build_launch_command(exe: str, args_str: str, windows: bool | None = None):
+    """Command for subprocess.Popen from an exe path and a user-typed args string.
+
+    "Quoted arguments" stay together. On Windows the string is handed over as
+    typed (after the quoted exe) so the game parses it by Windows' own rules
+    and backslashes in paths stay literal; elsewhere it is split shell-style.
+    Raises ValueError for unbalanced quotes.
+    """
+    windows = os.name == "nt" if windows is None else windows
+    args_str = (args_str or "").strip()
+    if windows:
+        return subprocess.list2cmdline([exe]) + (f" {args_str}" if args_str else "")
+    return [exe, *shlex.split(args_str)]
+
+
 def reveal_in_file_manager(path: Path):
     """Open a folder in the OS file manager (best effort, cross-platform)."""
     try:
@@ -824,12 +1110,16 @@ class DownloadWorker(QObject):
         super().__init__()
         self.repo = repo
         self.dest_dir = dest_dir
+        self.cancelled = False
 
     def run(self):
         try:
             r = requests.get(f"https://api.github.com/repos/{self.repo}/releases/latest",
                              headers={"User-Agent": USER_AGENT,
                                       "Accept": "application/vnd.github+json"}, timeout=20)
+            limited = github_rate_limit_message(r)
+            if limited:
+                raise RuntimeError(limited)
             r.raise_for_status()
             data = r.json()
             tag = data.get("tag_name", "")
@@ -839,24 +1129,109 @@ class DownloadWorker(QObject):
                                    f"https://github.com/{self.repo}/releases"), tag)
                 return
             url = asset["browser_download_url"]
-            dest = Path(self.dest_dir) / asset["name"]
-            with requests.get(url, headers={"User-Agent": USER_AGENT},
-                              stream=True, timeout=60) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get("content-length", 0))
-                got = 0
-                with dest.open("wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        if chunk:
-                            f.write(chunk)
-                            got += len(chunk)
-                            if total:
-                                self.progress.emit(int(got * 100 / total))
-                            else:
-                                self.progress.emit(-1)
+            # never let a release's asset name escape the chosen folder
+            name = Path(str(asset["name"]).replace("\\", "/")).name or "download"
+            dest = Path(self.dest_dir) / name
+            # Write to "<name>.part" and rename when complete, so a failed or
+            # interrupted download never leaves a truncated archive behind.
+            part = dest.with_name(dest.name + ".part")
+            try:
+                with requests.get(url, headers={"User-Agent": USER_AGENT},
+                                  stream=True, timeout=60) as resp:
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length", 0))
+                    got = 0
+                    last_pct = None
+                    with part.open("wb") as f:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if self.cancelled:
+                                raise RuntimeError("Download cancelled.")
+                            if chunk:
+                                f.write(chunk)
+                                got += len(chunk)
+                                pct = int(got * 100 / total) if total else -1
+                                if pct != last_pct:
+                                    last_pct = pct
+                                    self.progress.emit(pct)
+                    if total and got != total:
+                        raise RuntimeError(
+                            f"Download incomplete ({got} of {total} bytes).")
+                part.replace(dest)
+            except BaseException:
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                raise
             self.finished.emit(str(dest), tag)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class ScanWorker(QObject):
+    """Walk a folder for game executables off the GUI thread."""
+    finished = pyqtSignal(list)           # [(path_str, match_or_None)]
+
+    def __init__(self, root: str):
+        super().__init__()
+        self.root = root
+        self.cancelled = False
+
+    def run(self):
+        try:
+            paths = find_game_executables(Path(self.root),
+                                          cancelled=lambda: self.cancelled)
+        except Exception:
+            paths = []
+        self.finished.emit([(str(p), identify_exe(str(p))) for p in paths])
+
+
+def start_worker(owner, worker: QObject, done_signals, on_finished=None) -> QThread:
+    """Run ``worker.run`` on a new QThread tracked in ``owner._threads``.
+
+    The thread stops when any of ``done_signals`` fires; ``on_finished`` (if
+    given) is then called on the GUI thread. Finished threads are removed from
+    ``owner._threads`` so the list only holds work still in flight, which is
+    what stop_workers() needs at shutdown.
+    """
+    thread = QThread(owner)
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    for sig in done_signals:
+        sig.connect(thread.quit)
+    entry = (thread, worker)
+
+    def cleanup():
+        thread.wait(5000)                 # 'finished' fires just before the end
+        if entry in owner._threads:
+            owner._threads.remove(entry)
+        thread.deleteLater()
+        if on_finished:
+            on_finished()
+
+    thread.finished.connect(cleanup)
+    owner._threads.append(entry)
+    thread.start()
+    return thread
+
+
+def stop_workers(owner, timeout_ms: int = 4000) -> None:
+    """Ask every running worker to stop and wait for its thread (app exit)."""
+    for thread, worker in list(owner._threads):
+        if hasattr(worker, "cancelled"):
+            worker.cancelled = True
+        try:
+            thread.quit()
+        except RuntimeError:              # already deleted
+            continue
+    for thread, _worker in list(owner._threads):
+        try:
+            if not thread.wait(timeout_ms):
+                thread.terminate()        # stuck in a network call: last resort
+                thread.wait(1000)
+        except RuntimeError:
+            pass
+    owner._threads.clear()
 
 
 # ======================================================================
@@ -2045,10 +2420,7 @@ class DownloadLibraryDialog(QDialog):
 
         self.download_btn.setEnabled(False)
         self.status.setText("Checking the official release and downloading…")
-        thread = QThread()
         worker = DownloadWorker(entry["github_repo"], dest)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
 
         def on_progress(pct):
             if pct >= 0:
@@ -2078,12 +2450,8 @@ class DownloadLibraryDialog(QDialog):
         worker.finished.connect(on_finished)
         worker.no_asset.connect(on_no_asset)
         worker.failed.connect(on_failed)
-        for sig in (worker.finished, worker.no_asset, worker.failed):
-            sig.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self.main._threads.append((thread, worker))
-        thread.start()
+        start_worker(self.main, worker,
+                     (worker.finished, worker.no_asset, worker.failed))
 
 
 class SettingsDialog(QDialog):
@@ -2099,6 +2467,7 @@ class SettingsDialog(QDialog):
 
         self.sgdb_edit = QLineEdit(settings.get("sgdb_api_key", ""))
         self.sgdb_edit.setPlaceholderText("Optional — premium hand-picked covers")
+        self.sgdb_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
 
         self.tray_check = QCheckBox("Minimize to system tray instead of quitting")
         self.tray_check.setChecked(settings.get("minimize_to_tray", False))
@@ -2110,6 +2479,16 @@ class SettingsDialog(QDialog):
         self.ra_user_edit.setPlaceholderText("RetroAchievements username")
         self.ra_key_edit = QLineEdit(settings.get("ra_api_key", ""))
         self.ra_key_edit.setPlaceholderText("Web API key — see link above")
+        self.ra_key_edit.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+
+        if secrets_in_keyring():
+            storage = "🔒 API keys are kept in your system's credential store."
+        else:
+            storage = ("⚠ No system credential store is available, so API keys are "
+                       "kept in data/settings.json on this computer.")
+        storage_note = QLabel(storage)
+        storage_note.setWordWrap(True)
+        storage_note.setObjectName("subtle")
 
         info = QLabel(
             "<b>Fetch Info</b> uses <a href='https://en.wikipedia.org'>Wikipedia</a> "
@@ -2136,6 +2515,7 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(self)
         v.addWidget(info)
         v.addLayout(form)
+        v.addWidget(storage_note)
         v.addWidget(self.tray_check)
         v.addWidget(self.launch_check)
         v.addWidget(btns)
@@ -2157,6 +2537,7 @@ class ScanDialog(QDialog):
         self.setWindowTitle("Scan folder for games")
         self.setMinimumSize(560, 460)
         self.found: list[tuple[str, str]] = []   # (display_name, exe_path)
+        self._worker = None                      # scan in progress, if any
 
         top = QHBoxLayout()
         self.path_edit = QLineEdit()
@@ -2190,20 +2571,28 @@ class ScanDialog(QDialog):
             self._scan()
 
     def _scan(self):
-        root = Path(self.path_edit.text().strip())
+        text = self.path_edit.text().strip()
+        root = Path(text)
         self.list.clear()
-        if not root.exists():
+        if not text or not root.is_dir():
             self.status.setText("Folder not found.")
             return
-        exes = []
-        for pattern in ("*.exe", "*.AppImage"):   # AppImage covers Linux libraries
-            for p in root.rglob(pattern):
-                if SCAN_BLACKLIST.search(p.name):
-                    continue
-                exes.append(p)
+        if self._worker is not None:          # a previous scan is still walking
+            self._worker.cancelled = True
+        self.status.setText("Scanning…")
+        worker = self._worker = ScanWorker(str(root))
+        worker.finished.connect(
+            lambda results, w=worker, r=root: self._show_results(w, r, results))
+        start_worker(self.parent(), worker, (worker.finished,))
+
+    def _show_results(self, worker, root: Path, results: list):
+        if worker is not self._worker:        # superseded by a newer scan
+            return
+        self._worker = None
+        self.list.clear()
         recognized = 0
-        for p in sorted(exes):
-            match = identify_exe(str(p))
+        for path, match in results:
+            p = Path(path)
             if match:
                 recognized += 1
                 name = match["title"]
@@ -2215,11 +2604,17 @@ class ScanDialog(QDialog):
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
-            item.setData(Qt.ItemDataRole.UserRole, (name, str(p), match))
+            item.setData(Qt.ItemDataRole.UserRole, (name, path, match))
             self.list.addItem(item)
         self.status.setText(
-            f"Found {len(exes)} executable(s) — {recognized} auto-recognized, "
-            f"{len(exes) - recognized} unknown.")
+            f"Found {len(results)} executable(s) — {recognized} auto-recognized, "
+            f"{len(results) - recognized} unknown.")
+
+    def done(self, result):
+        if self._worker is not None:          # closing mid-scan
+            self._worker.cancelled = True
+            self._worker = None
+        super().done(result)
 
     def selected(self) -> list[tuple]:
         """Return [(name, exe_path, match_or_None), ...] for checked rows."""
@@ -2560,6 +2955,22 @@ class LauncherWindow(QMainWindow):
 
         if self.settings.get("check_updates_on_launch", True):
             QTimer.singleShot(1500, self.check_updates_quiet)
+
+        # bank playtime every few minutes so a crash or power cut loses little
+        self._playtime_timer = QTimer(self)
+        self._playtime_timer.timeout.connect(self._credit_running_sessions)
+        self._playtime_timer.start(5 * 60 * 1000)
+
+        if LOAD_WARNINGS:
+            QTimer.singleShot(300, self._show_load_warnings)
+
+    def _show_load_warnings(self):
+        problems = "\n\n".join(LOAD_WARNINGS)
+        LOAD_WARNINGS.clear()
+        QMessageBox.warning(
+            self, "Problem reading saved data",
+            f"{problems}\n\nThe launcher started with defaults for that file. "
+            f"Your data folder is:\n{DATA_DIR}")
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -3058,9 +3469,14 @@ class LauncherWindow(QMainWindow):
         if idx > 0:
             prof = g.get("profiles", [])[idx - 1]
             args_str = prof.get("args", "")
-        args = args_str.split() if args_str else []
         try:
-            proc = subprocess.Popen([exe, *args], cwd=str(Path(exe).parent))
+            cmd = build_launch_command(exe, args_str)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot launch",
+                                f"The launch arguments could not be read: {e}")
+            return
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(Path(exe).parent))
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e))
             return
@@ -3130,10 +3546,7 @@ class LauncherWindow(QMainWindow):
         sgdb = self.settings.get("sgdb_api_key", "").strip()
         self.statusBar().showMessage(
             f"Fetching info ({done}/{self._fetch_total}): {g.get('title')}…")
-        thread = QThread()
         worker = FetchWorker(query, gid, sgdb_key=sgdb)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
 
         def apply(data, gid=gid):
             gg = self._game(gid)
@@ -3145,14 +3558,8 @@ class LauncherWindow(QMainWindow):
                 self._persist()
 
         worker.finished.connect(apply)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._fetch_next)   # chain to next game
-        self._threads.append((thread, worker))
-        thread.start()
+        start_worker(self, worker, (worker.finished, worker.failed),
+                     on_finished=self._fetch_next)      # chain to next game
 
     def fetch_selected(self):
         if not self.selected_id:
@@ -3164,21 +3571,10 @@ class LauncherWindow(QMainWindow):
         sgdb = self.settings.get("sgdb_api_key", "").strip()
         self.statusBar().showMessage(
             f"Fetching {'Wikipedia + SteamGridDB' if sgdb else 'Wikipedia'} info for '{query}'…")
-        thread = QThread()
         worker = FetchWorker(query, g["id"], sgdb_key=sgdb)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.finished.connect(self._on_fetched)
         worker.failed.connect(self._on_fetch_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(lambda: self._threads.remove((thread, worker))
-                                if (thread, worker) in self._threads else None)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._threads.append((thread, worker))
-        thread.start()
+        start_worker(self, worker, (worker.finished, worker.failed))
 
     def _on_fetched(self, data: dict):
         if not self.selected_id:
@@ -3217,10 +3613,7 @@ class LauncherWindow(QMainWindow):
         gid = g["id"]
         self.download_btn.setEnabled(False)
         self.statusBar().showMessage(f"Downloading latest {g['title']}…")
-        thread = QThread()
         worker = DownloadWorker(repo, dest)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
 
         def on_progress(pct):
             if pct >= 0:
@@ -3256,82 +3649,59 @@ class LauncherWindow(QMainWindow):
         worker.finished.connect(on_finished)
         worker.no_asset.connect(on_no_asset)
         worker.failed.connect(on_failed)
-        for sig in (worker.finished, worker.no_asset, worker.failed):
-            sig.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._threads.append((thread, worker))
-        thread.start()
+        start_worker(self, worker,
+                     (worker.finished, worker.no_asset, worker.failed))
+
+    def _games_with_updates(self) -> list[dict]:
+        return [g for g in self.games
+                if g.get("latest_version") and g.get("installed_version")
+                and g["latest_version"] != g["installed_version"]]
+
+    def _check_updates(self, quiet: bool):
+        jobs = [(g["id"], g["github_repo"]) for g in self.games if g.get("github_repo")]
+        if not jobs:
+            if not quiet:
+                self.toast("No games have a GitHub repo set (Edit → GitHub repo).")
+            return
+        if getattr(self, "_update_check_running", False):
+            return
+        self._update_check_running = True
+        if not quiet:
+            self.statusBar().showMessage(f"Checking {len(jobs)} game(s) for updates…")
+        worker = UpdateWorker(jobs)
+        worker.one.connect(self._on_update_one)
+        worker.rate_limited.connect(
+            lambda msg: self.statusBar().showMessage(msg, 10000))
+        worker.done.connect(lambda n, quiet=quiet: self._on_updates_done(n, quiet))
+        start_worker(self, worker, (worker.done,))
 
     def check_updates_quiet(self):
         """Background update check on launch — no modal, toast only if updates exist."""
-        jobs = [(g["id"], g["github_repo"]) for g in self.games if g.get("github_repo")]
-        if not jobs:
-            return
-        thread = QThread()
-        worker = UpdateWorker(jobs)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.one.connect(self._on_update_one)
-        worker.done.connect(self._on_updates_quiet_done)
-        worker.done.connect(thread.quit)
-        worker.done.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._threads.append((thread, worker))
-        thread.start()
-
-    def _on_updates_quiet_done(self, n: int):
-        self._persist()
-        self.model.refresh_all()
-        if self.selected_id:
-            g = self._game(self.selected_id)
-            if g:
-                self._render_update_label(g)
-        updates = [g for g in self.games
-                   if g.get("latest_version") and g.get("installed_version")
-                   and g["latest_version"] != g["installed_version"]]
-        if updates:
-            names = ", ".join(g["title"] for g in updates[:3])
-            extra = f" +{len(updates) - 3} more" if len(updates) > 3 else ""
-            self.toast(f"Updates available: {names}{extra}")
+        self._check_updates(quiet=True)
 
     def check_updates_all(self):
-        jobs = [(g["id"], g["github_repo"]) for g in self.games if g.get("github_repo")]
-        if not jobs:
-            self.toast("No games have a GitHub repo set (Edit → GitHub repo).")
-            return
-        self.statusBar().showMessage(f"Checking {len(jobs)} repo(s) for updates…")
-        thread = QThread()
-        worker = UpdateWorker(jobs)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.one.connect(self._on_update_one)
-        worker.done.connect(self._on_updates_done)
-        worker.done.connect(thread.quit)
-        worker.done.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._threads.append((thread, worker))
-        thread.start()
+        self._check_updates(quiet=False)
 
     def _on_update_one(self, gid: str, tag: str):
         g = self._game(gid)
         if g:
             g["latest_version"] = tag
 
-    def _on_updates_done(self, n: int):
+    def _on_updates_done(self, n: int, quiet: bool = False):
+        self._update_check_running = False
         self._persist()
+        self.model.refresh_all()
         if self.selected_id:
             g = self._game(self.selected_id)
             if g:
                 self._render_update_label(g)
-        updates = [g for g in self.games
-                   if g.get("latest_version") and g.get("installed_version")
-                   and g["latest_version"] != g["installed_version"]]
+        updates = self._games_with_updates()
         if updates:
             names = ", ".join(g["title"] for g in updates[:3])
-            self.toast(f"Updates available: {names}")
-        else:
-            self.toast(f"Checked {n} repo(s) — all current / versions unknown.")
+            extra = f" +{len(updates) - 3} more" if len(updates) > 3 else ""
+            self.toast(f"Updates available: {names}{extra}")
+        elif not quiet:
+            self.toast(f"Checked {n} game(s) — all current / versions unknown.")
 
     # ---------------- settings ----------------
     def open_settings(self):
@@ -3387,20 +3757,11 @@ class LauncherWindow(QMainWindow):
             return
         self.ra_btn.setEnabled(False)
         self.ra_status.setText("Fetching from RetroAchievements…")
-        thread = QThread()
         worker = RAWorker(g["id"], g.get("search_name") or g.get("title", ""),
                           list(g.get("tags", [])), g.get("ra_game_id", ""), user, key)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
         worker.finished.connect(self._on_ra_done)
         worker.failed.connect(self._on_ra_failed)
-        for sig in (worker.finished, worker.failed):
-            sig.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._threads.append((thread, worker))
-        thread.start()
+        start_worker(self, worker, (worker.finished, worker.failed))
 
     def _on_ra_done(self, lib_id: str, payload: dict):
         self._ra_cache[lib_id] = payload
@@ -3490,6 +3851,32 @@ class LauncherWindow(QMainWindow):
         self._really_quit = True
         QApplication.instance().quit()
 
+    def _credit_running_sessions(self):
+        """Bank the playtime of games still running, restarting their clocks."""
+        now = time.monotonic()
+        changed = False
+        for gid, (proc, start) in list(self.running.items()):
+            g = self._game(gid)
+            if g:
+                g["playtime_seconds"] = int(g.get("playtime_seconds", 0) + (now - start))
+                changed = True
+            self.running[gid] = (proc, now)
+        if changed:
+            self._persist()
+
+    def _shutdown(self):
+        """Runs once as the app exits: save playtime, stop background work."""
+        if getattr(self, "_shut_down", False):
+            return
+        self._shut_down = True
+        self._proc_timer.stop()
+        try:
+            self._credit_running_sessions()
+        except OSError:
+            pass
+        self._fetch_queue = []
+        stop_workers(self)
+
     def closeEvent(self, e):
         if self.settings.get("minimize_to_tray") and not getattr(self, "_really_quit", False):
             e.ignore()
@@ -3498,7 +3885,9 @@ class LauncherWindow(QMainWindow):
                                   QSystemTrayIcon.MessageIcon.Information, 2000)
         else:
             self.tray.hide()
+            self._shutdown()
             e.accept()
+            QApplication.instance().quit()
 
 
 def main():
@@ -3507,6 +3896,7 @@ def main():
     app.setWindowIcon(app_icon())
     QApplication.setQuitOnLastWindowClosed(False)
     w = LauncherWindow()
+    app.aboutToQuit.connect(w._shutdown)
     w.show()
     sys.exit(app.exec())
 

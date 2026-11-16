@@ -29,7 +29,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build single-file executable
-        run: pyinstaller --noconfirm --onefile --windowed --name ReCompLauncher recomplauncher.py
+        run: pyinstaller --noconfirm --onefile --windowed --collect-all keyring --hidden-import win32ctypes.core.ctypes --name ReCompLauncher recomplauncher.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -64,7 +64,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build single-file binary
-        run: pyinstaller --noconfirm --onefile --name ReCompLauncher-Linux recomplauncher.py
+        run: pyinstaller --noconfirm --onefile --collect-all keyring --name ReCompLauncher-Linux recomplauncher.py
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

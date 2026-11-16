@@ -56,6 +56,19 @@ python recomplauncher.py
 
 Requires **Python 3.10+**.
 
+### Where your data lives
+
+Your library, art, screenshots and settings are kept in a `data/` folder next to
+the app (next to `ReCompLauncher.exe`, or next to `recomplauncher.py` when running
+from source). If that location is read-only, a per-user folder is used instead
+(`%APPDATA%\ReCompLauncher`, `~/Library/Application Support/ReCompLauncher`, or
+`~/.local/share/ReCompLauncher`).
+
+API keys (SteamGridDB, RetroAchievements) are stored in your system's credential
+store — Windows Credential Manager, macOS Keychain, or Secret Service / KWallet on
+Linux — not in `settings.json`. On a system with no credential store they stay in
+`data/settings.json`, and the Settings dialog tells you so.
+
 ---
 
 ## 🚀 Quick start
@@ -77,6 +90,7 @@ Auto-identified out of the box (the list lives in `KNOWN_RECOMPS` in [`recomplau
 | Game | Project | Platform |
 |------|---------|----------|
 | Ocarina of Time | Ship of Harkinian | N64 |
+| Ocarina of Time | [Triforce](https://triforceproject.com/) (identify only — not hosted on GitHub) | N64 |
 | Majora's Mask | 2 Ship 2 Harkinian / Zelda64Recompiled | N64 |
 | Star Fox 64 | Starship | N64 |
 | Perfect Dark | perfect_dark | N64 |

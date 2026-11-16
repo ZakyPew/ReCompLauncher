@@ -1,2 +1,3 @@
 PyQt6>=6.6
 requests>=2.31
+keyring>=24   # stores API keys in the OS credential store (optional at runtime)
